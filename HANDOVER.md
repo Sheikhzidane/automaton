@@ -72,3 +72,43 @@ changes.
 Never in this repository (it is public). Mission state is in
 `~/.automaton/state.db`; daily reports in `~/.automaton/mission/reports/`.
 Import a private plan with `automaton --mission seed --file <path outside the repo>`.
+
+---
+
+# Addendum (31 October): growth operations engine
+
+Branch: `growth-ops-engine` (on top of `mission-mode-and-security-fixes`).
+
+## Verified on this branch before adding anything
+
+- `pnpm typecheck` passes; `npx vitest run src/__tests__/mission` 101/101;
+  full suite 1,715/1,715 in 69 files (`context-hardening.test.ts` excluded,
+  it hangs offline as noted above); `pnpm build` passes.
+- `node dist/index.js --mission verify-controls` 10/10 PASS on a scratch home.
+- GitHub Actions has never run on this fork (forks start with Actions
+  disabled), so the CI workflow here has not run either.
+
+## What was added
+
+`ops/`: a dependency-free scheduled runner for deterministic mission work
+(health checks of OpsLog's public pages, counts-only OpsLog metrics, weekly
+FSA open data refresh with prospect signals, pipeline, revenue and backlog
+reviews, daily report). Details and guarantees in `ops/README.md`.
+Tests: `src/__tests__/ops` (14) and `node ops/run.mjs verify-controls` (15).
+
+## Why the schedule lives in the OpsLog repository
+
+- Actions is disabled on this fork, and enabling it is the owner's click.
+- This repository is public. Prospects, pipeline notes and revenue must not
+  be. State therefore lives on the private OpsLog repo's `growth-ops` branch
+  and the workflow there checks this engine out **by commit**.
+
+## Relationship to mission mode
+
+Mission mode (`src/mission`) is the supervised agent: it reasons, drafts and
+asks for approvals, and needs a funded model key. The ops engine is the
+part that must run every day for free. They share the rules (pseudonymous
+counterparties, settled-and-evidenced revenue only, approvals for money)
+but not a database: the ops ledger is a hash-chained JSONL file so it can
+live in git. If mission mode is later funded and deployed, import the ops
+pipeline and ledger with `automaton --mission seed`.
