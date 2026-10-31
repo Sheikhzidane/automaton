@@ -7,6 +7,7 @@
  */
 
 import { execSync } from "child_process";
+import { scrubbedEnv } from "../security/env.js";
 import fs from "fs";
 import nodePath from "path";
 import type {
@@ -115,6 +116,8 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
         encoding: "utf-8",
         maxBuffer: 10 * 1024 * 1024,
         cwd: process.env.HOME || "/root",
+        // Never hand provider keys or tokens to a child shell.
+        env: scrubbedEnv(),
       });
       return { stdout: stdout || "", stderr: "", exitCode: 0 };
     } catch (err: any) {

@@ -17,6 +17,7 @@ import type {
   TickContext,
 } from "../types.js";
 import { buildTickContext } from "./tick-context.js";
+import { resolveEffectiveTier } from "../mission/budget.js";
 import {
   getHeartbeatSchedule,
   updateHeartbeatSchedule,
@@ -96,6 +97,13 @@ export class DurableScheduler {
         this.config,
         this.legacyContext.identity.address,
         this.legacyContext.identity.chainType,
+      );
+      // Budget-aware scheduling: in mission mode the tier follows the
+      // mission's compute runway (unchanged when the mission is off).
+      context.survivalTier = resolveEffectiveTier(
+        this.db,
+        this.legacyContext.config,
+        context.survivalTier,
       );
 
       // Get tasks that are due

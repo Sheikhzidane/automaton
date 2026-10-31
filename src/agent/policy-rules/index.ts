@@ -13,6 +13,8 @@ import { createPathProtectionRules } from "./path-protection.js";
 import { createFinancialRules } from "./financial.js";
 import { createAuthorityRules } from "./authority.js";
 import { createRateLimitRules } from "./rate-limits.js";
+import { createSecurityRules } from "./security.js";
+import { createMissionPolicyRules } from "../../mission/policy.js";
 
 /**
  * Create the default set of policy rules.
@@ -28,5 +30,8 @@ export function createDefaultRules(
     ...createFinancialRules(treasuryPolicy),
     ...createAuthorityRules(),
     ...createRateLimitRules(),
+    ...createSecurityRules(),
+    // Mission rules are inert unless config.mission.enabled is true.
+    ...createMissionPolicyRules(),
   ];
 }

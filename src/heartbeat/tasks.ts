@@ -23,6 +23,8 @@ import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
 import { metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
 import { ulid } from "ulid";
+import { isAutoSpendAllowed, isMissionEnabled } from "../mission/config.js";
+import { runMissionReview } from "../mission/heartbeat.js";
 
 const logger = createLogger("heartbeat.tasks");
 
@@ -110,6 +112,12 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
     // transition to dead. This gives the agent time to receive funding before dying.
     // USDC can't go negative, so dead is only reached via this timeout.
     const DEAD_GRACE_PERIOD_MS = 3_600_000; // 1 hour
+    // In mission mode survival follows the mission's compute runway; zero
+    // Conway credits is normal when compute is paid for another way.
+    if (isMissionEnabled(taskCtx.config)) {
+      taskCtx.db.deleteKV("zero_credits_since");
+      return { shouldWake: false };
+    }
     if (tier === "critical" && credits === 0) {
       const zeroSince = taskCtx.db.getKV("zero_credits_since");
       if (!zeroSince) {
@@ -155,6 +163,12 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       credits,
       timestamp: new Date().toISOString(),
     }));
+
+    // Mission mode: no automatic purchases. Every real-money spend needs an
+    // approved request, and this heartbeat path bypasses the policy engine.
+    if (!isAutoSpendAllowed(taskCtx.config)) {
+      return { shouldWake: false };
+    }
 
     const MIN_TOPUP_USD = 5;
     if (balance >= MIN_TOPUP_USD && (ctx.survivalTier === "critical" || ctx.survivalTier === "dead")) {
@@ -432,6 +446,17 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
     taskCtx.db.setKV("health_check_status", "ok");
     taskCtx.db.setKV("last_health_check", new Date().toISOString());
     return { shouldWake: false };
+  },
+
+  // === Commercial mission: deterministic daily review (no inference) ===
+  mission_review: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    if (!isMissionEnabled(taskCtx.config)) return { shouldWake: false };
+    try {
+      return await runMissionReview(taskCtx.db.raw, taskCtx.config);
+    } catch (error) {
+      logger.error("mission_review failed", error instanceof Error ? error : undefined);
+      return { shouldWake: false };
+    }
   },
 
   // === Phase 4.1: Metrics Reporting ===

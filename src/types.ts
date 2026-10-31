@@ -75,6 +75,21 @@ export interface AutomatonConfig {
   rpcUrl?: string;
   /** Chain type for this automaton. Defaults to "evm" if absent. */
   chainType?: ChainType;
+  /** Agent safety switches. Both default to off. */
+  security?: SecurityConfig;
+  /** Commercial mission (GBP budget, ledger, approvals). Off unless enabled. */
+  mission?: Partial<import("./mission/types.js").MissionConfig>;
+}
+
+export interface SecurityConfig {
+  /**
+   * Allow the agent's exec tool to run on the host when no sandbox is set.
+   * Off by default: local mode would otherwise give the model a shell on the
+   * operator's own machine.
+   */
+  allowHostExec?: boolean;
+  /** Allow spawning and funding child automatons. Off by default. */
+  replicationEnabled?: boolean;
 }
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
@@ -161,7 +176,8 @@ export type ToolCategory =
   | "git"
   | "registry"
   | "replication"
-  | "memory";
+  | "memory"
+  | "mission";
 
 export interface ToolContext {
   identity: AutomatonIdentity;

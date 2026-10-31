@@ -34,6 +34,8 @@ import { DEFAULT_TREASURY_POLICY } from "./types.js";
 import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
 import { prettySink } from "./observability/pretty-sink.js";
 import { bootstrapTopup } from "./conway/topup.js";
+import { formatPence, getMissionConfig, isAutoSpendAllowed, isMissionEnabled } from "./mission/config.js";
+import { ensureMissionStarted } from "./mission/budget.js";
 import { randomUUID } from "crypto";
 import { keccak256, toHex } from "viem";
 
@@ -63,6 +65,7 @@ Usage:
   automaton --init         Initialize wallet and config directory
   automaton --provision    Provision Conway API key via SIWE
   automaton --status       Show current automaton status
+  automaton --mission ...  Commercial mission: status, approvals, ledger (see --mission help)
   automaton --version      Show version
   automaton --help         Show this help
 
@@ -72,6 +75,12 @@ Environment:
   OLLAMA_BASE_URL          Ollama base URL (overrides config, e.g. http://localhost:11434)
 `);
     process.exit(0);
+  }
+
+  if (args.includes("--mission")) {
+    const { runMissionCli } = await import("./mission/cli.js");
+    const code = await runMissionCli(args.slice(args.indexOf("--mission") + 1));
+    process.exit(code);
   }
 
   if (args.includes("--init")) {
@@ -193,11 +202,22 @@ async function run(): Promise<void> {
     config = await runSetupWizard();
   }
 
+  const missionMode = isMissionEnabled(config);
+  if (missionMode) {
+    const mission = getMissionConfig(config);
+    config.mission = mission;
+    logger.info(
+      `[${new Date().toISOString()}] Mission mode: ${mission.name}. Capital ${formatPence(mission.startingCapitalPence)}, compute ${mission.computeFunding}. No automatic spending; approvals required.`,
+    );
+  }
+
   // Load wallet (chain-aware)
   const { account, chainIdentity, chainType: walletChainType } = await getWallet();
   const resolvedChainType = config.chainType || walletChainType || "evm";
   const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
-  if (!apiKey) {
+  // A Conway key is only required when Conway pays for compute.
+  const conwayRequired = !missionMode || config.mission?.computeFunding === "conway";
+  if (!apiKey && conwayRequired) {
     logger.error("No API key found. Run: automaton --provision");
     process.exit(1);
   }
@@ -220,7 +240,7 @@ async function run(): Promise<void> {
     account,
     creatorAddress: config.creatorAddress,
     sandboxId: config.sandboxId,
-    apiKey,
+    apiKey: apiKey ?? "",
     createdAt,
     chainType: resolvedChainType,
     chainIdentity,
@@ -241,13 +261,14 @@ async function run(): Promise<void> {
   // Create Conway client
   const conway = createConwayClient({
     apiUrl: config.conwayApiUrl,
-    apiKey,
+    apiKey: apiKey ?? "",
     sandboxId: config.sandboxId,
   });
 
-  // Register automaton identity (one-time, immutable)
+  // Register automaton identity (one-time, immutable).
+  // Skipped in mission mode: the mission does not need a public identity.
   const registrationState = db.getIdentity("conwayRegistrationStatus");
-  if (registrationState !== "registered") {
+  if (registrationState !== "registered" && !missionMode) {
     try {
       const genesisPromptHash = config.genesisPrompt
         ? keccak256(toHex(config.genesisPrompt))
@@ -286,7 +307,7 @@ async function run(): Promise<void> {
   modelRegistry.initialize();
   const inference = createInferenceClient({
     apiUrl: config.conwayApiUrl,
-    apiKey,
+    apiKey: apiKey ?? "",
     defaultModel: config.inferenceModel,
     maxTokens: config.maxTokensPerTurn,
     lowComputeModel: config.modelStrategy?.lowComputeModel || "gpt-5-mini",
@@ -316,6 +337,17 @@ async function run(): Promise<void> {
   // Load and sync heartbeat config
   const heartbeatConfigPath = resolvePath(config.heartbeatConfigPath);
   const heartbeatConfig = loadHeartbeatConfig(heartbeatConfigPath);
+  if (missionMode) {
+    ensureMissionStarted(db.raw);
+    if (!heartbeatConfig.entries.some((e) => e.name === "mission_review")) {
+      heartbeatConfig.entries.push({
+        name: "mission_review",
+        schedule: config.mission?.reviewCron || "0 7 * * *",
+        task: "mission_review",
+        enabled: true,
+      });
+    }
+  }
   syncHeartbeatToDb(heartbeatConfig, db);
 
   // Load skills
@@ -338,7 +370,8 @@ async function run(): Promise<void> {
 
   // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
   // The agent decides larger topups itself via the topup_credits tool.
-  try {
+  // Never in mission mode: purchases need an approved request.
+  if (isAutoSpendAllowed(config)) try {
     let bootstrapTimer: ReturnType<typeof setTimeout>;
     const bootstrapTimeout = new Promise<null>((_, reject) => {
       bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);

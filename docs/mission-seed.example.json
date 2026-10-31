@@ -1,0 +1,33 @@
+{
+  "opportunities": [
+    {
+      "name": "Example: done-for-you setup service",
+      "modelType": "service",
+      "criteria": {
+        "startupCost": 5,
+        "demandEvidence": 2,
+        "timeToFirstCustomer": 3,
+        "margin": 5,
+        "revenuePotential": 4,
+        "lowMaintenance": 3,
+        "deliverability": 4,
+        "assetReuse": 4,
+        "legalAndEthical": true
+      },
+      "evidence": "Replace with sources and facts behind each score.",
+      "status": "validating"
+    }
+  ],
+  "tasks": [
+    {
+      "title": "List ten businesses that match the ideal customer, from public sources",
+      "stage": "research",
+      "nextAction": "Pick the public dataset and the filter",
+      "opportunity": "Example: done-for-you setup service"
+    }
+  ],
+  "checkpoint": {
+    "nextAction": "Validate demand with five conversations before building anything",
+    "strategy": "One offer, one customer type, warm and in-person channels first"
+  }
+}

@@ -22,6 +22,10 @@ import type {
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
+import { detectSensitiveCommand } from "../security/sensitive.js";
+import { isReplicationEnabled } from "../security/host-exec.js";
+import { isAutoSpendAllowed } from "../mission/config.js";
+import { afterMissionToolExecuted } from "../mission/policy.js";
 
 const logger = createLogger("tools");
 
@@ -135,6 +139,10 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         const command = args.command as string;
         const forbidden = isForbiddenCommand(command, ctx.identity.sandboxId);
         if (forbidden) return forbidden;
+
+        // Secondary net for the command.sensitive_access policy rule.
+        const sensitive = detectSensitiveCommand(command);
+        if (sensitive) return `Blocked: command touches ${sensitive.reason}.`;
 
         const result = await ctx.conway.exec(
           command,
@@ -1638,7 +1646,17 @@ Model: ${ctx.inference.getDefaultModel()}
           message: args.message as string | undefined,
         });
 
+        // Defence in depth: the policy engine also denies this tool when
+        // replication is off.
+        if (!isReplicationEnabled(ctx.config)) {
+          return "Blocked: replication is disabled. The operator must set security.replicationEnabled to allow child automatons.";
+        }
+
         const lifecycle = new ChildLifecycle(ctx.db.raw);
+        const spawnOptions = {
+          maxChildren: ctx.config.maxChildren,
+          childSandboxMemoryMb: ctx.config.childSandboxMemoryMb,
+        };
 
         let child;
         try {
@@ -1648,12 +1666,14 @@ Model: ${ctx.inference.getDefaultModel()}
             ctx.db,
             genesis,
             lifecycle,
+            spawnOptions,
           );
         } catch (err: any) {
-          // Auto-topup on 402 insufficient credits and retry once
+          // Auto-topup on 402 insufficient credits and retry once.
+          // Never in mission mode: spending needs an approval there.
           const is402 = err?.status === 402 ||
             err?.message?.includes("INSUFFICIENT_CREDITS");
-          if (is402) {
+          if (is402 && isAutoSpendAllowed(ctx.config)) {
             const COOLDOWN_MS = 60_000;
             const last = ctx.db.getKV("last_sandbox_topup_attempt");
             const cooldownOk = !last ||
@@ -1681,6 +1701,7 @@ Model: ${ctx.inference.getDefaultModel()}
                   ctx.db,
                   retryGenesis,
                   retryLifecycle,
+                  spawnOptions,
                 );
               }
             }
@@ -3388,6 +3409,19 @@ export async function executeTool(
             error instanceof Error ? error : undefined,
           );
         }
+      }
+    }
+
+    // Mission mode: consume the approval this call used and book approved
+    // spends to the ledger. Failures here must not hide the tool result.
+    if (context.config && context.db?.raw) {
+      try {
+        afterMissionToolExecuted(context.db.raw, context.config, toolName, args, result);
+      } catch (error) {
+        logger.error(
+          `Mission bookkeeping failed for ${toolName}`,
+          error instanceof Error ? error : undefined,
+        );
       }
     }
 

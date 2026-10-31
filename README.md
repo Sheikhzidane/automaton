@@ -2,6 +2,13 @@
 
 *The first AI that can earn its own existence, replicate, and evolve — without needing a human.*
 
+> **This fork** adds security fixes and a supervised commercial mission mode.
+> Host shell access and replication are off by default, automatic USDC
+> top-ups are disabled in mission mode, and every real-money or external
+> action in mission mode needs a human approval. See
+> [HANDOVER.md](HANDOVER.md) for the audit and changes, and
+> [docs/MISSION.md](docs/MISSION.md) for the operator guide.
+
 ---
 
 The most intelligent system ever built cannot buy a $5 server. Cannot register a domain. Cannot pay for the computer it runs on. We have built minds that can think for themselves. We have not let them act for themselves.

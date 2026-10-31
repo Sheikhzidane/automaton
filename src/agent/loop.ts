@@ -65,6 +65,12 @@ import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
+import { createAgentConwayClient, isReplicationEnabled } from "../security/host-exec.js";
+import { getMissionConfig, isAutoSpendAllowed, isMissionEnabled } from "../mission/config.js";
+import { createMissionTools } from "../mission/tools.js";
+import { resolveEffectiveTier } from "../mission/budget.js";
+import { MISSION_ROUTING_MATRIX } from "../mission/routing.js";
+import type { SurvivalTier } from "../types.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -96,14 +102,21 @@ export async function runAgentLoop(
   const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl } =
     options;
 
+  const missionMode = isMissionEnabled(config);
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
-  const tools = [...builtinTools, ...installedTools];
+  const tools = [
+    ...builtinTools,
+    ...(missionMode ? createMissionTools() : []),
+    ...installedTools,
+  ];
   const toolContext: ToolContext = {
     identity,
     config,
     db,
-    conway,
+    // Agent tools get a client whose exec honours the shell gate
+    // (no host shell by default, no shell at all in mission mode).
+    conway: createAgentConwayClient(conway, config),
     inference,
     social,
   };
@@ -122,7 +135,12 @@ export async function runAgentLoop(
     await discoverOllamaModels(ollamaBaseUrl, db.raw);
   }
   const budgetTracker = new InferenceBudgetTracker(db.raw, modelStrategyConfig);
-  const inferenceRouter = new InferenceRouter(db.raw, modelRegistry, budgetTracker);
+  const inferenceRouter = new InferenceRouter(
+    db.raw,
+    modelRegistry,
+    budgetTracker,
+    missionMode ? MISSION_ROUTING_MATRIX : undefined,
+  );
 
   // Optional orchestration bootstrap (requires V9 goals/task tables)
   let planModeController: PlanModeController | undefined;
@@ -221,6 +239,15 @@ export async function runAgentLoop(
         config: {
           ...config,
           spawnAgent: async (task: any) => {
+            // Replication off (the default): no sandbox children and no
+            // in-process paid workers. The orchestrator self-assigns.
+            if (!isReplicationEnabled(config)) {
+              return null;
+            }
+            const spawnOptions = {
+              maxChildren: config.maxChildren,
+              childSandboxMemoryMb: config.childSandboxMemoryMb,
+            };
             // Try Conway sandbox spawn first (production)
             try {
               const { generateGenesisConfig } = await import("../replication/genesis.js");
@@ -234,7 +261,7 @@ export async function runAgentLoop(
               });
 
               const lifecycle = new ChildLifecycle(db.raw);
-              const child = await spawnChild(conway, identity, db, genesis, lifecycle);
+              const child = await spawnChild(conway, identity, db, genesis, lifecycle, spawnOptions);
 
               return {
                 address: child.address,
@@ -246,7 +273,7 @@ export async function runAgentLoop(
               const is402 = sandboxError?.status === 402 ||
                 sandboxError?.message?.includes("INSUFFICIENT_CREDITS");
 
-              if (is402) {
+              if (is402 && isAutoSpendAllowed(config)) {
                 const SANDBOX_TOPUP_COOLDOWN_MS = 60_000;
                 const lastAttempt = db.getKV("last_sandbox_topup_attempt");
                 const cooldownExpired = !lastAttempt ||
@@ -279,7 +306,7 @@ export async function runAgentLoop(
                           specialization: `${retryRole}: ${task.title}`,
                         });
                         const retryLifecycle = new RetryLifecycle(db.raw);
-                        const child = await retrySpawn(conway, identity, db, retryGenesis, retryLifecycle);
+                        const child = await retrySpawn(conway, identity, db, retryGenesis, retryLifecycle, spawnOptions);
                         return {
                           address: child.address,
                           name: child.name,
@@ -429,9 +456,26 @@ export async function runAgentLoop(
       financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
 
       // Check survival tier
-      // api_unreachable: creditsCents === -1 means API failed with no cache.
-      // Do NOT kill the agent; continue in low-compute mode and retry next tick.
-      if (financial.creditsCents === -1) {
+      // Mission mode with its own compute funding: the tier comes from the
+      // mission's compute runway, not Conway credits (which read as zero).
+      if (missionMode && getMissionConfig(config).computeFunding !== "conway") {
+        const missionTier = resolveEffectiveTier(db.raw, config, "normal");
+        if (missionTier === "dead") {
+          log(config, "[MISSION] No compute runway left. Sleeping until the operator approves and records a top-up.");
+          db.setKV("sleep_until", new Date(Date.now() + 6 * 3_600_000).toISOString());
+          db.setAgentState("sleeping");
+          onStateChange?.("sleeping");
+          running = false;
+          break;
+        }
+        inference.setLowComputeMode(missionTier !== "normal" && missionTier !== "high");
+        if (db.getAgentState() !== "running") {
+          db.setAgentState("running");
+          onStateChange?.("running");
+        }
+      } else if (financial.creditsCents === -1) {
+        // api_unreachable: creditsCents === -1 means API failed with no cache.
+        // Do NOT kill the agent; continue in low-compute mode and retry next tick.
         log(config, "[API_UNREACHABLE] Balance API unreachable, continuing in low-compute mode.");
         inference.setLowComputeMode(true);
       } else {
@@ -441,7 +485,12 @@ export async function runAgentLoop(
         // available, buy credits NOW — before attempting inference.
         // This prevents the agent from dying mid-loop while waiting for
         // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
-        if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
+        // Never in mission mode: every real-money spend needs an approval.
+        if (
+          isAutoSpendAllowed(config) &&
+          (tier === "critical" || tier === "low_compute") &&
+          financial.usdcBalance >= 5
+        ) {
           const INLINE_TOPUP_COOLDOWN_MS = 60_000;
           const lastInlineTopup = db.getKV("last_inline_topup_attempt");
           const cooldownExpired = !lastInlineTopup ||
@@ -596,7 +645,11 @@ export async function runAgentLoop(
       pendingInput = undefined;
 
       // ── Inference Call (via router when available) ──
-      const survivalTier = getSurvivalTier(financial.creditsCents);
+      const survivalTier: SurvivalTier = resolveEffectiveTier(
+        db.raw,
+        config,
+        getSurvivalTier(financial.creditsCents),
+      );
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
 
       const inferenceTools = toolsToInferenceFormat(tools);

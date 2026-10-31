@@ -76,6 +76,32 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "agent/policy-engine.js",
   "agent/policy-rules/index.ts",
   "agent/policy-rules/index.js",
+  // Security fixes and mission financial controls: the agent must never
+  // be able to weaken the rules that bound it, even with an approval.
+  "agent/policy-rules/security.ts",
+  "agent/policy-rules/security.js",
+  "security/env.ts",
+  "security/env.js",
+  "security/sensitive.ts",
+  "security/sensitive.js",
+  "security/host-exec.ts",
+  "security/host-exec.js",
+  "mission/policy.ts",
+  "mission/policy.js",
+  "mission/approvals.ts",
+  "mission/approvals.js",
+  "mission/ledger.ts",
+  "mission/ledger.js",
+  "mission/budget.ts",
+  "mission/budget.js",
+  "mission/config.ts",
+  "mission/config.js",
+  "mission/cli.ts",
+  "mission/cli.js",
+  "mission/web-fetch.ts",
+  "mission/web-fetch.js",
+  "state/schema.ts",
+  "state/schema.js",
 ]);
 
 /**

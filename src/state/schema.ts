@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -656,6 +656,153 @@ export const MIGRATION_V11 = `
   -- Schema version: 11
   -- Add chain_type column to children table for multi-chain support
   ALTER TABLE children ADD COLUMN chain_type TEXT DEFAULT 'evm';
+`;
+
+// === Commercial Mission: GBP ledger, approvals, tasks, opportunities ===
+
+export const MIGRATION_V12 = `
+  -- Schema version: 12
+  -- Tables: mission_ledger (append-only), mission_approvals,
+  --         mission_capital_grants (append-only), mission_tasks,
+  --         mission_opportunities, mission_milestones, mission_events (append-only)
+
+  CREATE TABLE IF NOT EXISTS mission_ledger (
+    id TEXT PRIMARY KEY,
+    entry_type TEXT NOT NULL CHECK(entry_type IN ('revenue','expense','refund','fee')),
+    status TEXT NOT NULL CHECK(status IN ('settled','pending')),
+    amount_pence INTEGER NOT NULL CHECK(amount_pence > 0),
+    category TEXT NOT NULL,
+    description TEXT NOT NULL,
+    counterparty_ref TEXT,
+    evidence_ref TEXT,
+    original_currency TEXT,
+    original_amount_minor INTEGER,
+    related_party INTEGER NOT NULL DEFAULT 0 CHECK(related_party IN (0,1)),
+    attributable INTEGER NOT NULL DEFAULT 1 CHECK(attributable IN (0,1)),
+    approval_id TEXT UNIQUE,
+    supersedes_id TEXT UNIQUE REFERENCES mission_ledger(id),
+    recorded_by TEXT NOT NULL CHECK(recorded_by IN ('human','system')),
+    occurred_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_mission_ledger_type ON mission_ledger(entry_type, status);
+
+  CREATE TRIGGER IF NOT EXISTS mission_ledger_no_update
+  BEFORE UPDATE ON mission_ledger
+  BEGIN
+    SELECT RAISE(ABORT, 'mission_ledger is append-only');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS mission_ledger_no_delete
+  BEFORE DELETE ON mission_ledger
+  BEGIN
+    SELECT RAISE(ABORT, 'mission_ledger is append-only');
+  END;
+
+  CREATE TABLE IF NOT EXISTS mission_approvals (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('spend','outreach','publish','contract','external_action','capital','other')),
+    tool_name TEXT,
+    summary TEXT NOT NULL,
+    amount_pence INTEGER NOT NULL DEFAULT 0 CHECK(amount_pence >= 0),
+    args_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK(status IN ('pending','approved','rejected','consumed','expired')),
+    requested_by TEXT NOT NULL CHECK(requested_by IN ('agent','human','system')),
+    requested_at TEXT NOT NULL,
+    decided_at TEXT,
+    decided_by TEXT,
+    decision_note TEXT,
+    consumed_at TEXT,
+    expires_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_mission_approvals_status ON mission_approvals(status);
+  CREATE INDEX IF NOT EXISTS idx_mission_approvals_tool ON mission_approvals(tool_name, args_hash);
+
+  CREATE TABLE IF NOT EXISTS mission_capital_grants (
+    id TEXT PRIMARY KEY,
+    amount_pence INTEGER NOT NULL CHECK(amount_pence > 0),
+    reason TEXT NOT NULL,
+    granted_by TEXT NOT NULL CHECK(granted_by = 'human'),
+    granted_at TEXT NOT NULL
+  );
+
+  CREATE TRIGGER IF NOT EXISTS mission_capital_grants_no_update
+  BEFORE UPDATE ON mission_capital_grants
+  BEGIN
+    SELECT RAISE(ABORT, 'mission_capital_grants is append-only');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS mission_capital_grants_no_delete
+  BEFORE DELETE ON mission_capital_grants
+  BEGIN
+    SELECT RAISE(ABORT, 'mission_capital_grants is append-only');
+  END;
+
+  CREATE TABLE IF NOT EXISTS mission_tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+      CHECK(status IN ('queued','in_progress','blocked','awaiting_approval','done','dropped')),
+    priority INTEGER NOT NULL DEFAULT 50,
+    next_action TEXT,
+    blocked_reason TEXT,
+    opportunity_id TEXT,
+    result TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_mission_tasks_status ON mission_tasks(status, priority);
+
+  CREATE TABLE IF NOT EXISTS mission_opportunities (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    model_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate'
+      CHECK(status IN ('candidate','validating','active','paused','rejected','won')),
+    criteria TEXT NOT NULL,
+    score REAL NOT NULL,
+    rejection_reason TEXT,
+    evidence TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS mission_milestones (
+    stage INTEGER PRIMARY KEY,
+    threshold_pence INTEGER NOT NULL,
+    achieved_at TEXT NOT NULL,
+    net_pence_at_achievement INTEGER NOT NULL,
+    evidence_entry_ids TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS mission_events (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    data TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_mission_events_type ON mission_events(event_type, created_at);
+
+  CREATE TRIGGER IF NOT EXISTS mission_events_no_update
+  BEFORE UPDATE ON mission_events
+  BEGIN
+    SELECT RAISE(ABORT, 'mission_events is append-only');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS mission_events_no_delete
+  BEFORE DELETE ON mission_events
+  BEGIN
+    SELECT RAISE(ABORT, 'mission_events is append-only');
+  END;
 `;
 
 export const MIGRATION_V10 = `

@@ -52,13 +52,32 @@ export function isValidWalletAddress(address: string, chainType?: ChainType): bo
 /**
  * Spawn a child automaton in a new Conway sandbox using lifecycle state machine.
  */
+export interface SpawnChildOptions {
+  /**
+   * Maximum live children. Callers pass config.maxChildren. Upstream read
+   * this from `(db as any).config`, which never exists, so the configured
+   * value was silently ignored and the cap was always 3.
+   */
+  maxChildren?: number;
+  /** Child sandbox memory in MB (config.childSandboxMemoryMb). */
+  childSandboxMemoryMb?: number;
+}
+
+export const DEFAULT_MAX_CHILDREN = 3;
+
 export async function spawnChild(
   conway: ConwayClient,
   identity: AutomatonIdentity,
   db: AutomatonDatabase,
   genesis: GenesisConfig,
   lifecycle?: ChildLifecycle,
+  options: SpawnChildOptions = {},
 ): Promise<ChildAutomaton> {
+  const maxChildren = options.maxChildren ?? DEFAULT_MAX_CHILDREN;
+  if (!Number.isFinite(maxChildren) || maxChildren <= 0) {
+    throw new Error("Cannot spawn: replication is disabled (maxChildren is 0).");
+  }
+
   // Check child limit from config
   const existing = db
     .getChildren()
@@ -68,7 +87,6 @@ export async function spawnChild(
         c.status !== "cleaned_up" &&
         c.status !== "failed",
     );
-  const maxChildren = (db as any).config?.maxChildren ?? 3;
   if (existing.length >= maxChildren) {
     throw new Error(
       `Cannot spawn: already at max children (${maxChildren}). Kill or wait for existing children to die.`,
@@ -79,18 +97,17 @@ export async function spawnChild(
   let sandboxId: string | undefined;
   let reusedSandbox: { id: string } | null = null;
 
+  const childMemoryMb = options.childSandboxMemoryMb ?? 1024;
+
   // If no lifecycle provided, use legacy path
   if (!lifecycle) {
-    return spawnChildLegacy(conway, identity, db, genesis, childId);
+    return spawnChildLegacy(conway, identity, db, genesis, childId, childMemoryMb);
   }
 
   try {
     // State: requested
     const childChainType = genesis.chainType || (identity as any).chainType || "evm";
     lifecycle.initChild(childId, genesis.name, "", genesis.genesisPrompt, childChainType);
-
-    // Get child sandbox memory from config (default 1024MB)
-    const childMemoryMb = (db as any).config?.childSandboxMemoryMb ?? 1024;
 
     // Try to reuse an existing sandbox whose DB record is 'failed' but
     // is still running remotely, before creating a new one.
@@ -244,11 +261,9 @@ async function spawnChildLegacy(
   db: AutomatonDatabase,
   genesis: GenesisConfig,
   childId: string,
+  childMemoryMb: number,
 ): Promise<ChildAutomaton> {
   let sandboxId: string | undefined;
-
-  // Get child sandbox memory from config (default 1024MB)
-  const childMemoryMb = (db as any).config?.childSandboxMemoryMb ?? 1024;
 
   const legacyTier = selectSandboxTier(childMemoryMb);
 

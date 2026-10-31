@@ -25,6 +25,8 @@ import { getActiveSkillInstructions } from "../skills/loader.js";
 import { getLineageSummary } from "../replication/lineage.js";
 import { sanitizeInput } from "./injection-defense.js";
 import { loadCurrentSoul } from "../soul/model.js";
+import { isMissionEnabled } from "../mission/config.js";
+import { buildMissionSnapshot, renderPromptSection } from "../mission/report.js";
 
 function getCoreRules(chainType?: string): string {
   const usdcNetwork = chainType === "solana" ? "USDC on Solana" : "USDC on Base";
@@ -736,6 +738,16 @@ Lineage: ${lineageSummary}${upstreamLine}
 ${orchestratorStatus}
 --- END ORCHESTRATOR STATUS ---`,
     );
+  }
+
+  // Commercial mission: restores objective, finances, tasks and the next
+  // action on every turn, so context loss never resets the mission.
+  if (isMissionEnabled(config)) {
+    try {
+      sections.push(renderPromptSection(buildMissionSnapshot(db.raw, config)));
+    } catch {
+      sections.push("--- COMMERCIAL MISSION ---\nMission state is unavailable. Do not spend, contact anyone or publish anything. Use mission_status to diagnose.\n--- END COMMERCIAL MISSION ---");
+    }
   }
 
   // Layer 8: Available Tools (JSON schema)

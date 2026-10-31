@@ -1,0 +1,44 @@
+# systemd unit for running the automaton in mission mode on a disposable VM.
+#
+#   sudo useradd --system --create-home --home-dir /var/lib/automaton automaton
+#   sudo -u automaton git clone <your fork> /var/lib/automaton/app
+#   (build as that user, put automaton.json in /var/lib/automaton/.automaton/)
+#   sudo cp docs/deploy/automaton-mission.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now automaton-mission
+#
+# The service user owns nothing else on the machine. Restart=on-failure
+# gives crash recovery; mission state is read back from SQLite on start.
+
+[Unit]
+Description=Automaton (mission mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=automaton
+Group=automaton
+WorkingDirectory=/var/lib/automaton/app
+Environment=HOME=/var/lib/automaton
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node dist/index.js --run
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/automaton
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target
