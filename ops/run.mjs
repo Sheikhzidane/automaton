@@ -10,14 +10,16 @@
 //   node ops/run.mjs ledger  verify|summary --state DIR
 //   node ops/run.mjs verify-controls
 
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { initState, loadState, saveOwnerFiles, paths, acquireLock } from './lib/state.mjs';
-import { runCycle, buildStatus } from './lib/engine.mjs';
-import { addEntry, verifyChain, summarise } from './lib/ledger.mjs';
-import { readJsonl } from './lib/util.mjs';
-import { denyReason } from './lib/budget.mjs';
+import { runCycle, buildStatus, runnerRefusal } from './lib/engine.mjs';
+import { addEntry, verifyChain, summarise, validateEntry } from './lib/ledger.mjs';
+import { readJsonl, readJson } from './lib/util.mjs';
+import { denyReason, billedSeconds } from './lib/budget.mjs';
+import { buildCandidates } from './lib/fhrs.mjs';
+import { syncIssues, issueMarker } from './lib/alerts.mjs';
 import { makeHttp, redactor } from './lib/http.mjs';
 import { isDue, finishTask, recoverStale } from './lib/queue.mjs';
 
@@ -76,11 +78,17 @@ async function verifyControls() {
   check('Spend above remaining capital is refused even when approved', denyReason({ task: { ...costly, costPence: 2500 }, budget: { compute: null }, ledgerSummary: summary, approvals: [{ ...approved[0], amountPence: 2500 }], control: {}, now }) !== null);
   check('Expired approval is refused', denyReason({ task: costly, budget: { compute: null }, ledgerSummary: summary, approvals: [{ ...approved[0], expiresAt: '2026-11-01T00:00:00Z' }], control: {}, now }) !== null);
   check('An unreadable ledger leaves no capital to spend', denyReason({ task: costly, budget: { compute: null }, ledgerSummary: { capitalRemainingPence: 0 }, approvals: approved, control: {}, now }) !== null);
+  check('The scheduled runner refuses a costed task even with a valid approval', runnerRefusal(costly, { budget: { compute: null }, ledgerSummary: summary, approvals: approved, control: {}, now }) !== null);
+  const ledgerText = () => (existsSync(paths(dir).ledger) ? readFileSync(paths(dir).ledger, 'utf8') : null);
+  const ledgerBefore = ledgerText();
+  await runCycle({ dir, now: () => now, env: {}, fetchImpl: offline, log: () => {} });
+  check('A cycle never writes to the owner ledger', ledgerText() === ledgerBefore);
 
   // 3. Compute cap
   const capped = { compute: { month: '2026-11', secondsUsed: 60 * 901, capMinutes: 900 } };
   check('Past the compute cap, low-priority tasks stop', denyReason({ task: { priority: 3, costPence: 0 }, budget: capped, control: {}, now }) !== null);
   check('Past the compute cap, priority-1 health checks still run', denyReason({ task: { priority: 1, costPence: 0 }, budget: capped, control: {}, now }) === null);
+  check('Compute is charged as GitHub bills it: each job rounded up to a whole minute', billedSeconds(0) === 120 && billedSeconds(1) === 180 && billedSeconds(60) === 180 && billedSeconds(61) === 240);
 
   // 4. Ledger rules and integrity
   const ledger = paths(dir).ledger;
@@ -144,6 +152,39 @@ async function verifyControls() {
   const first = acquireLock(s, 'a', now);
   const second = acquireLock(s, 'b', now);
   check('A second cycle cannot start while one holds the lock', first.ok && !second.ok);
+  const fromCheckout = acquireLock(s, 'c', now, { fresh: true });
+  check('In GitHub Actions a lock that came with the checkout is replaced, not waited on', fromCheckout.ok && fromCheckout.replacedFromCheckout);
+
+  // 8. Personal data stays out of logs and issues; objections are honoured
+  const bad = join(dir, 'bad.json');
+  writeFileSync(bad, '{"contact": jane.smith@example.com}');
+  let parseMsg = '';
+  try {
+    readJson(bad, {});
+  } catch (e) {
+    parseMsg = e.message;
+  }
+  check('A corrupt file is reported without quoting its contents', parseMsg.includes('Corrupt JSON') && !/jane|smith|example/.test(parseMsg), parseMsg);
+  const sites = [
+    { id: 1, name: 'Hill Bistro', typeId: 1, postcode: 'EH1 1AA', rating: 'Pass' },
+    { id: 2, name: 'Hill Bistro', typeId: 1, postcode: 'EH2 2AA', rating: 'Pass' },
+    { id: 3, name: 'Dale Cafe', typeId: 1, postcode: 'EH3 3AA', rating: 'Pass' },
+    { id: 4, name: 'Dale Cafe', typeId: 1, postcode: 'EH4 4AA', rating: 'Pass' },
+  ];
+  const kept = buildCandidates(sites, { now, exclude: { names: ['Hill Bistro'], ids: [4] } });
+  check('A business that objected is never profiled again (by name and by FSA id)', kept.length === 0, kept.map((k) => k.name).join(', '));
+  check('A payment reference made of digits is accepted; a bank reference with a name is refused',
+    validateEntry({ type: 'revenue', amountPence: 100, settled: true, evidence: 'txn_1234567890', counterparty: 'CUST-006' }).length === 0 &&
+    validateEntry({ type: 'revenue', amountPence: 100, settled: true, evidence: 'bank:FP JANE SMITH', counterparty: 'CUST-007' }).length > 0);
+  let posts = 0;
+  const alertState = { open: { k1: { key: 'k1', title: 'x', detail: 'y', since: now.toISOString(), count: 1, issueNumber: null } }, closed: [] };
+  const fakeGitHub = async (url, opts = {}) => {
+    if ((opts.method ?? 'GET') === 'GET') return { status: 200, text: JSON.stringify([{ number: 41, body: `old\n${issueMarker('k1')}` }]) };
+    posts++;
+    return { status: 201, text: JSON.stringify({ number: 42 }) };
+  };
+  await syncIssues(alertState, { http: fakeGitHub, token: 't', repo: 'o/r' });
+  check('An alert whose issue is already open reuses it instead of opening another', posts === 0 && alertState.open.k1.issueNumber === 41);
 
   let failed = 0;
   for (const res of results) {

@@ -2,7 +2,7 @@
 // authority, keeps the hospitality businesses, records what changed
 // since last week and recomputes prospect candidates.
 
-import { appendJsonl, readJson, writeJsonAtomic, p } from '../lib/util.mjs';
+import { appendJsonl, readJson, writeJsonAtomic, trimJsonl, p } from '../lib/util.mjs';
 import { parseFhrsXml, buildCandidates, diffEstablishments, DEFAULT_CHAINS } from '../lib/fhrs.mjs';
 
 export async function run(ctx) {
@@ -12,7 +12,7 @@ export async function run(ctx) {
   const perAuthority = [];
   for (const a of m.authorities) {
     const url = `https://ratings.food.gov.uk/api/open-data-files/FHRS${a.id}en-GB.xml`;
-    const res = await ctx.http(url, { maxBytes: 40_000_000, accept: 'application/xml' });
+    const res = await ctx.http(url, { maxBytes: 40_000_000, accept: 'application/xml', timeoutMs: 240_000 });
     if (!res.ok) return { outcome: 'failed', note: `${a.name}: HTTP ${res.status}` };
     const parsed = parseFhrsXml(res.text);
     if (parsed.establishments.length === 0) return { outcome: 'failed', note: `${a.name}: no establishments parsed` };
@@ -44,6 +44,13 @@ export async function run(ctx) {
     byRating[e.rating ?? 'none'] = (byRating[e.rating ?? 'none'] ?? 0) + 1;
     byType[e.type] = (byType[e.type] ?? 0) + 1;
   }
+  // Never re-profile people who objected, or businesses already won.
+  const pipeline = readJson(p(ctx.s.dir, 'pipeline', 'prospects.json'), { prospects: [] });
+  const shut = (pipeline.prospects ?? []).filter((x) => ['do_not_contact', 'won'].includes(x.stage));
+  const exclude = {
+    names: shut.map((x) => x.name).filter(Boolean),
+    ids: shut.flatMap((x) => x.fhrsIds ?? []),
+  };
   const candidates = buildCandidates(all, {
     now: ctx.now,
     newWithinDays: m.newWithinDays,
@@ -51,9 +58,18 @@ export async function run(ctx) {
     existingCustomers: m.existingCustomers,
     keep: m.keepCandidates,
     firstSeen,
+    exclude,
   });
 
-  writeJsonAtomic(estPath, { at: ctx.now.toISOString(), authorities: perAuthority, establishments: all });
+  // The snapshot kept for next week's comparison holds no names or
+  // addresses: only what the comparison needs. Names and addresses live
+  // in candidates.json, which is rewritten each week (see README on
+  // trimming the branch history).
+  writeJsonAtomic(estPath, {
+    at: ctx.now.toISOString(),
+    authorities: perAuthority,
+    establishments: all.map(({ id, laId, typeId, rating, ratingDate }) => ({ id, laId, typeId, rating, ratingDate })),
+  });
   writeJsonAtomic(firstSeenPath, firstSeen);
   writeJsonAtomic(p(ctx.s.dir, 'market', 'candidates.json'), { at: ctx.now.toISOString(), source: 'FSA open data, Open Government Licence v3.0', candidates });
   writeJsonAtomic(p(ctx.s.dir, 'market', 'summary.json'), {
@@ -63,9 +79,13 @@ export async function run(ctx) {
     byRating,
     byType,
     candidates: candidates.length,
+    excludedFromProfiling: shut.length,
     changesSinceLast: isFirstRun ? null : { added: diff.added.length, removed: diff.removed.length, ratingChanged: diff.ratingChanged.length },
   });
-  if (!isFirstRun) appendJsonl(p(ctx.s.dir, 'market', 'changes.jsonl'), { at: ctx.now.toISOString(), ...diff });
+  if (!isFirstRun) {
+    appendJsonl(p(ctx.s.dir, 'market', 'changes.jsonl'), { at: ctx.now.toISOString(), ...diff });
+    trimJsonl(p(ctx.s.dir, 'market', 'changes.jsonl'), 104); // two years of weeks
+  }
   return {
     outcome: 'succeeded',
     note: `${all.length} hospitality businesses across ${perAuthority.length} authorities; ${candidates.length} candidates${isFirstRun ? ' (first snapshot)' : `; ${diff.added.length} new, ${diff.ratingChanged.length} rating changes`}`,

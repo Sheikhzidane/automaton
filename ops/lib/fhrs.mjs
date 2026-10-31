@@ -83,9 +83,14 @@ function isChain(norm, chains) {
 
 const TYPE_POINTS = { 1: 2, 7843: 2, 7842: 1, 7844: 0 };
 
-export function buildCandidates(establishments, { now, newWithinDays = 120, chains = DEFAULT_CHAINS, existingCustomers = [], keep = 150, firstSeen = {} }) {
+// `exclude` holds businesses that must not be profiled again: anyone who
+// asked not to be contacted (an objection to direct marketing, UK GDPR
+// Art. 21(3)) and anyone already won. Matched by FHRS id and by name.
+export function buildCandidates(establishments, { now, newWithinDays = 120, chains = DEFAULT_CHAINS, existingCustomers = [], keep = 150, firstSeen = {}, exclude = {} }) {
   const cutoff = now.valueOf() - newWithinDays * 86400000;
-  const existing = existingCustomers.map(normaliseName);
+  const existing = [...existingCustomers, ...(exclude.names ?? [])].map(normaliseName).filter(Boolean);
+  const excludedIds = new Set((exclude.ids ?? []).map(Number));
+  const excludedKeys = new Set();
   const groups = new Map();
   for (const e of establishments) {
     if (INSTITUTIONAL.test(e.name)) continue;
@@ -93,11 +98,16 @@ export function buildCandidates(establishments, { now, newWithinDays = 120, chai
     if (!norm || norm.length < 3) continue;
     if (isChain(norm, chains)) continue;
     if (existing.some((x) => norm === x || norm.startsWith(`${x} `))) continue;
+    if (excludedIds.has(e.id)) {
+      excludedKeys.add(norm); // one excluded site excludes the business
+      continue;
+    }
     if (!groups.has(norm)) groups.set(norm, []);
     groups.get(norm).push(e);
   }
   const candidates = [];
   for (const [key, sites] of groups) {
+    if (excludedKeys.has(key)) continue;
     const postcodes = new Set(sites.map((s) => s.postcode ?? s.address));
     const siteCount = postcodes.size;
     if (siteCount > 10) continue; // a national or large regional operator

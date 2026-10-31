@@ -5,9 +5,9 @@
 import { appendJsonl, readJsonl, trimJsonl, writeJsonAtomic, newId, readJson } from './util.mjs';
 import { loadState, saveState, acquireLock, releaseLock } from './state.mjs';
 import { dueTasks, recoverStale, startTask, finishTask } from './queue.mjs';
-import { denyReason, recordCompute, computeAllowance, approvalFor } from './budget.mjs';
+import { denyReason, recordCompute, computeAllowance, billedSeconds } from './budget.mjs';
 import { raise, resolve, syncIssues } from './alerts.mjs';
-import { safeSummary, verifyChain, addEntry } from './ledger.mjs';
+import { safeSummary, verifyChain } from './ledger.mjs';
 import { nextCronTime } from './cron.mjs';
 import { makeHttp, redactor } from './http.mjs';
 import { JOBS } from '../jobs/index.mjs';
@@ -16,6 +16,17 @@ function jobTimeoutMs(task, config) {
   if (task.job === 'fsa-refresh') return 10 * 60 * 1000;
   if (task.job === 'public-health') return (config.opslog.pages.length * config.http.timeoutMs) + 30000;
   return 120000;
+}
+
+// Why the scheduled runner will not run a task now, or null. The ledger
+// is written by people only, and the runner saves only engine-owned
+// files, so it can never book a cost: a task that costs money is refused
+// here whatever approval exists.
+export function runnerRefusal(task, { budget, ledgerSummary, approvals, control, now }) {
+  if (task.costPence > 0) {
+    return `Costs ${task.costPence}p; the scheduled runner never runs a task that costs money. Record the spend in the ledger, then run it by hand.`;
+  }
+  return denyReason({ task, budget, ledgerSummary, approvals, control, now });
 }
 
 export function buildStatus(s, { now, cycle }) {
@@ -88,7 +99,7 @@ export async function runCycle({ dir, now = () => new Date(), env = process.env,
   const say = (level, message, extra) => log(level, redact(message), extra ? JSON.parse(redact(JSON.stringify(extra))) : undefined);
   const s = loadState(dir);
   const staleLock = readJson(s.files.lock, null);
-  const lock = acquireLock(s, runId, started);
+  const lock = acquireLock(s, runId, started, { fresh: Boolean(env.GITHUB_ACTIONS) });
   if (!lock.ok) {
     say('warn', 'another cycle holds the lock; exiting', { heldBy: lock.heldBy, since: lock.since });
     return { ok: false, locked: true, runId, results: [] };
@@ -103,12 +114,21 @@ export async function runCycle({ dir, now = () => new Date(), env = process.env,
   const results = [];
   const raiseAt = (when) => (key, title, detail) => raise(s.alerts, key, redact(title), redact(detail), when);
   try {
-    if (lock.replacedStale && staleLock?.at) {
-      // The dead cycle used runner time the cap never saw.
+    if (lock.replacedFromCheckout) {
+      // Committed by mistake (state/lock.json is git-ignored). Not a dead
+      // run here: a run that dies in Actions was charged when it started.
+      say('warn', 'a lock file came with the checkout; replaced it without charging', { previous: staleLock?.runId ?? null });
+    } else if (lock.replacedStale && staleLock?.at) {
+      // A local cycle that died: it used time the cap never saw.
       const lost = Math.min(Math.max(0, started.valueOf() - new Date(staleLock.at).valueOf()) / 1000, 25 * 60);
-      recordCompute(s.budget, started, lost);
+      recordCompute(s.budget, started, billedSeconds(lost, s.config.compute));
       say('warn', 'replaced a stale lock from a cycle that did not finish', { previous: staleLock.runId, estimatedSeconds: Math.round(lost) });
     }
+    // Charge the least this run can be billed now, so a cycle that dies
+    // part-way is still counted; the rest is added when it finishes.
+    const minimumBilled = billedSeconds(0, s.config.compute);
+    recordCompute(s.budget, started, minimumBilled);
+    saveState(s);
     const { recovered, exhausted } = recoverStale(s.queue.tasks, started, runId);
     if (recovered.length) say('warn', 'recovered tasks from an interrupted cycle', { recovered });
     for (const id of exhausted) {
@@ -117,7 +137,7 @@ export async function runCycle({ dir, now = () => new Date(), env = process.env,
     }
 
     const http = makeHttp({ allowHosts: s.config.http.allowHosts, timeoutMs: s.config.http.timeoutMs, fetchImpl });
-    let { summary: ledgerSummary } = safeSummary(s.files.ledger, s.config.mission);
+    const { summary: ledgerSummary } = safeSummary(s.files.ledger, s.config.mission);
     const control = s.control;
     let due = dueTasks(s.queue.tasks, started);
     if (only) due = s.queue.tasks.filter((t) => t.id === only);
@@ -125,20 +145,13 @@ export async function runCycle({ dir, now = () => new Date(), env = process.env,
     if (control.paused) say('info', 'paused by the operator; no tasks run', { reason: control.reason });
     for (const task of control.paused ? [] : due) {
       const t0 = now();
-      const denied = denyReason({ task, budget: s.budget, ledgerSummary, approvals: s.approvals.approvals, control, now: t0 });
+      const denied = runnerRefusal(task, { budget: s.budget, ledgerSummary, approvals: s.approvals.approvals, control, now: t0 });
       if (denied) {
         finishTask(task, { outcome: 'blocked', note: denied }, t0, 0);
         results.push({ id: task.id, outcome: 'blocked', note: denied, ms: 0 });
         appendJsonl(s.files.runs, { runId, at: t0.toISOString(), task: task.id, outcome: 'blocked', ms: 0, note: denied });
         saveState(s);
         continue;
-      }
-      if (task.costPence > 0) {
-        // Use the approval once and book the cost before anything runs.
-        const approval = approvalFor({ task, budget: s.budget, approvals: s.approvals.approvals, now: t0 });
-        s.budget.approvalsUsed = [...(s.budget.approvalsUsed ?? []), approval.id];
-        addEntry(s.files.ledger, { type: 'expense', amountPence: task.costPence, settled: false, evidence: `approval:${approval.id}`, category: task.id, fundedFromCapital: true }, t0);
-        ledgerSummary = safeSummary(s.files.ledger, s.config.mission).summary;
       }
       startTask(task, t0, runId);
       saveState(s); // checkpoint: a crash from here leaves a lease to recover
@@ -197,7 +210,7 @@ export async function runCycle({ dir, now = () => new Date(), env = process.env,
     }
 
     const finished = now();
-    recordCompute(s.budget, finished, (finished.valueOf() - started.valueOf()) / 1000 + (s.config.compute.perRunOverheadSeconds ?? 45));
+    recordCompute(s.budget, finished, billedSeconds((finished.valueOf() - started.valueOf()) / 1000, s.config.compute) - minimumBilled);
     s.budget.compute.capMinutes = s.config.compute.monthlyMinutesCap;
     s.engine.cyclesTotal = (s.engine.cyclesTotal ?? 0) + 1;
     s.engine.lastCycleAt = cycle.startedAt;

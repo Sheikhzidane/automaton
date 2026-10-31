@@ -24,7 +24,9 @@ function hasCredentials(headers) {
 }
 
 export function makeHttp({ allowHosts, timeoutMs = 25000, fetchImpl = globalThis.fetch, userAgent = 'opslog-growth-ops/1 (+https://opslog.co.uk)' }) {
-  return async function request(url, { method = 'GET', headers = {}, body, maxBytes = 2_000_000, accept, signal } = {}) {
+  return async function request(url, { method = 'GET', headers = {}, body, maxBytes = 2_000_000, accept, signal, timeoutMs: perRequestMs } = {}) {
+    // A large download (the FSA files) may take longer than the default.
+    const limitMs = perRequestMs ?? timeoutMs;
     for (const [k, v] of Object.entries(headers)) {
       if (/[\r\n\0]/.test(String(v))) throw new Error(`Refused: the ${k} header contains a line break or control character (check the secret's value)`);
     }
@@ -36,7 +38,7 @@ export function makeHttp({ allowHosts, timeoutMs = 25000, fetchImpl = globalThis
       if (!hostAllowed(current, allowHosts)) {
         throw new Error(`Refused: ${new URL(current).hostname} is not an allowed host`);
       }
-      const timeout = AbortSignal.timeout(timeoutMs);
+      const timeout = AbortSignal.timeout(limitMs);
       const combined = signal ? AbortSignal.any([timeout, signal]) : timeout;
       const started = Date.now();
       let res;
@@ -50,7 +52,7 @@ export function makeHttp({ allowHosts, timeoutMs = 25000, fetchImpl = globalThis
         });
       } catch (err) {
         if (signal?.aborted) throw new Error('Cancelled: the job ran out of time');
-        if (timeout.aborted) throw new Error(`Timed out after ${timeoutMs} ms`);
+        if (timeout.aborted) throw new Error(`Timed out after ${limitMs} ms`);
         throw new Error(`Network error (${err?.cause?.code ?? err?.name ?? 'unknown'})`);
       }
       if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
@@ -90,7 +92,7 @@ export function makeHttp({ allowHosts, timeoutMs = 25000, fetchImpl = globalThis
       } catch (err) {
         if (/larger than/.test(err?.message ?? '')) throw err;
         if (signal?.aborted) throw new Error('Cancelled: the job ran out of time');
-        if (timeout.aborted) throw new Error(`Timed out after ${timeoutMs} ms`);
+        if (timeout.aborted) throw new Error(`Timed out after ${limitMs} ms`);
         throw new Error(`Network error while reading (${err?.cause?.code ?? err?.name ?? 'unknown'})`);
       }
       return {

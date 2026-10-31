@@ -14,6 +14,15 @@ export function computeAllowance(budget, now) {
   return budget.compute;
 }
 
+// What GitHub will bill for one run in which the cycle itself took
+// `cycleSeconds`: the cycle job rounded up to the minute, plus the other
+// jobs at their one-minute minimum.
+export function billedSeconds(cycleSeconds, compute = {}) {
+  const setup = compute.cycleJobSetupSeconds ?? 60;
+  const others = compute.otherBilledMinutesPerRun ?? 1;
+  return (Math.ceil((Math.max(0, cycleSeconds) + setup) / 60) + others) * 60;
+}
+
 export function recordCompute(budget, now, seconds) {
   const c = computeAllowance(budget, now);
   c.secondsUsed += Math.max(0, Math.round(seconds));

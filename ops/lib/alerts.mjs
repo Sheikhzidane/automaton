@@ -29,6 +29,12 @@ export function resolve(alerts, key, now) {
   return true;
 }
 
+// The marker that ties an issue to its alert, so a run whose state was
+// not saved adopts the issue it opened instead of opening another.
+export function issueMarker(key) {
+  return `<!-- growth-ops-alert:${String(key).replace(/[^A-Za-z0-9:._-]/g, '')} -->`;
+}
+
 export async function syncIssues(alerts, { http, token, repo, label = 'growth-ops-alert', log }) {
   if (!token || !repo) return { synced: 0, skipped: 'no GitHub token in this environment' };
   const headers = {
@@ -38,15 +44,35 @@ export async function syncIssues(alerts, { http, token, repo, label = 'growth-op
     'x-github-api-version': '2022-11-28',
   };
   let synced = 0;
-  for (const a of Object.values(alerts.open)) {
-    if (a.issueNumber) continue;
+  const unsynced = Object.values(alerts.open).filter((a) => !a.issueNumber);
+  let existing = null;
+  if (unsynced.length) {
+    try {
+      // Not filtered by label: GitHub drops labels silently for a token
+      // without push access, so the marker is what identifies an issue.
+      const res = await http(`https://api.github.com/repos/${repo}/issues?state=open&per_page=100`, { headers });
+      if (res.status === 200) existing = JSON.parse(res.text);
+      else log?.('warn', 'could not list open alert issues', { status: res.status });
+    } catch (err) {
+      log?.('warn', 'could not list open alert issues', { error: err.message });
+    }
+  }
+  for (const a of unsynced) {
+    // Without the list we cannot tell whether the issue already exists;
+    // wait for the next run rather than risk a duplicate.
+    if (!existing) break;
+    const found = existing.find((i) => typeof i?.body === 'string' && i.body.includes(issueMarker(a.key)));
+    if (found) {
+      a.issueNumber = found.number;
+      continue;
+    }
     try {
       const res = await http(`https://api.github.com/repos/${repo}/issues`, {
         method: 'POST',
         headers,
         body: JSON.stringify({
           title: `[growth-ops] ${a.title}`,
-          body: `${a.detail}\n\nOpened by the scheduled growth-ops run at ${a.since}. It closes itself when the problem clears.`,
+          body: `${a.detail}\n\nOpened by the scheduled growth-ops run at ${a.since}. It closes itself when the problem clears.\n\n${issueMarker(a.key)}`,
           labels: [label],
         }),
       });

@@ -8,14 +8,21 @@
 // activity, and not a duplicate of a payment already recorded.
 // Corrections never edit a line; they add one that supersedes it.
 
-import { appendJsonl, readJsonl, sha256, looksPersonal } from './util.mjs';
+import { appendJsonl, readJsonl, sha256, looksPersonal, looksEmail } from './util.mjs';
 
 export const LEDGER_TYPES = ['revenue', 'refund', 'expense', 'correction'];
 const GENESIS = '0'.repeat(64);
 
 // Payment, charge, payout, transfer or bank references. An invoice
-// number is not evidence that money arrived.
-export const PAYMENT_EVIDENCE = /^((pi|ch|py|po|tr|txn)_[A-Za-z0-9]{3,}|bank:[A-Za-z0-9 ._\/-]{4,})$/;
+// number is not evidence that money arrived. A bank reference has no
+// spaces, so a payer's name cannot be written in as one.
+export const PAYMENT_EVIDENCE = /^((pi|ch|py|po|tr|txn)_[A-Za-z0-9]{3,}|bank:[A-Za-z0-9._\/-]{4,40})$/;
+
+// A ledger line can never be erased, so it must hold nothing about a
+// person. Counterparties are pseudonyms; the mapping from pseudonym to
+// customer is kept outside the ledger, and deleting it is the erasure.
+const DESCRIPTION_MAX = 120;
+const CATEGORY = /^[a-z0-9._-]{1,40}$/;
 
 function canonical(entry) {
   const { hash, ...rest } = entry;
@@ -79,9 +86,17 @@ export function validateEntry(input, entries = []) {
     }
   }
   if (input.counterparty && !/^[A-Z]{2,8}-\d{1,6}$/.test(input.counterparty)) errors.push('counterparty must be a pseudonym such as CUST-001');
-  for (const field of ['description', 'evidence', 'category', 'counterparty']) {
+  if (input.category && !CATEGORY.test(input.category)) errors.push('category must be a short code such as licence or setup (lower case, no spaces)');
+  if (input.description && String(input.description).length > DESCRIPTION_MAX) {
+    errors.push(`description must be ${DESCRIPTION_MAX} characters or fewer, and must not name a person`);
+  }
+  for (const field of ['description', 'category', 'counterparty']) {
     if (looksPersonal(input[field])) errors.push(`${field} looks like it holds an email address or phone number; use a pseudonym`);
   }
+  // A payment reference is often a long run of digits (txn_1234567890,
+  // bank:20261031-60000), which the phone test would refuse. Its format
+  // is checked above and allows no spaces, so only an email is tested.
+  if (looksEmail(input.evidence)) errors.push('evidence looks like it holds an email address; use the payment reference');
   return errors;
 }
 

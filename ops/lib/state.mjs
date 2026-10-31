@@ -17,7 +17,9 @@ export const DEFAULT_CONFIG = {
   schemaVersion: 1,
   mission: { name: '£20 to £2,000', capitalPence: 2000, targetNetPence: 200000 },
   schedule: { cron: '37 */3 * * *', note: 'UTC; must match the workflow' },
-  compute: { monthlyMinutesCap: 900, perRunOverheadSeconds: 45 },
+  // GitHub bills each job rounded up to a whole minute. A run is two
+  // jobs: the cycle (checkout, Node, the cycle itself) and the save.
+  compute: { monthlyMinutesCap: 900, cycleJobSetupSeconds: 60, otherBilledMinutesPerRun: 1 },
   http: { allowHosts: ['opslog.co.uk', 'ratings.food.gov.uk', 'api.github.com'], timeoutMs: 25000 },
   opslog: {
     baseUrl: 'https://opslog.co.uk',
@@ -32,6 +34,7 @@ export const DEFAULT_CONFIG = {
   market: {
     authorities: [
       { id: 773, name: 'Edinburgh (City of)' },
+      { id: 781, name: 'East Lothian' },
       { id: 783, name: 'Midlothian' },
       { id: 782, name: 'West Lothian' },
     ],
@@ -132,13 +135,17 @@ export function initState(dir, overrides = {}) {
   return s;
 }
 
-export function acquireLock(s, runId, now) {
+// `fresh` is set where every run starts from a new checkout and the
+// workflow's concurrency group already stops two runs overlapping (GitHub
+// Actions). There, a lock found at start can only be one that was
+// committed by mistake: it is replaced, never waited on.
+export function acquireLock(s, runId, now, { fresh = false } = {}) {
   const held = readJson(s.files.lock, null);
-  if (held && now.valueOf() - new Date(held.at).valueOf() < LEASE_TIMEOUT_MS + 15 * 60 * 1000) {
+  if (held && !fresh && now.valueOf() - new Date(held.at).valueOf() < LEASE_TIMEOUT_MS + 15 * 60 * 1000) {
     return { ok: false, heldBy: held.runId, since: held.at };
   }
   writeJsonAtomic(s.files.lock, { runId, at: now.toISOString(), pid: process.pid, previous: held ?? null });
-  return { ok: true, replacedStale: Boolean(held) };
+  return { ok: true, replacedStale: Boolean(held), replacedFromCheckout: Boolean(held) && fresh };
 }
 
 export function releaseLock(s, runId) {

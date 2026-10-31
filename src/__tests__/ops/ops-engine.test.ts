@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // @ts-ignore plain ESM module without type declarations
-import { runCycle } from "../../../ops/lib/engine.mjs";
+import { runCycle, runnerRefusal } from "../../../ops/lib/engine.mjs";
 // @ts-ignore
 import { initState, loadState, saveState, saveOwnerFiles, paths } from "../../../ops/lib/state.mjs";
 // @ts-ignore
@@ -11,9 +11,15 @@ import { nextCronTime } from "../../../ops/lib/cron.mjs";
 // @ts-ignore
 import { parseFhrsXml, buildCandidates, normaliseName, diffEstablishments } from "../../../ops/lib/fhrs.mjs";
 // @ts-ignore
-import { addEntry, summarise, verifyChain } from "../../../ops/lib/ledger.mjs";
+import { addEntry, summarise, verifyChain, validateEntry } from "../../../ops/lib/ledger.mjs";
 // @ts-ignore
-import { readJsonl } from "../../../ops/lib/util.mjs";
+import { readJsonl, readJson } from "../../../ops/lib/util.mjs";
+// @ts-ignore
+import { billedSeconds } from "../../../ops/lib/budget.mjs";
+// @ts-ignore
+import { syncIssues, issueMarker } from "../../../ops/lib/alerts.mjs";
+// @ts-ignore
+import { makeHttp } from "../../../ops/lib/http.mjs";
 // @ts-ignore
 import { finishTask, isDue, reconcileTasks, recoverStale } from "../../../ops/lib/queue.mjs";
 
@@ -219,6 +225,7 @@ describe("growth ops: full cycle", () => {
     const routes = siteRoutes({ "https://opslog.co.uk/": { status: 500, body: "err" } });
     const impl = async (url: string, init: any) => {
       if (url.startsWith("https://api.github.com/")) {
+        if ((init?.method ?? "GET") === "GET") return new Response("[]", { status: 200 });
         posted.push({ url, body: JSON.parse(init.body) });
         return new Response(JSON.stringify({ number: 7 }), { status: 201 });
       }
@@ -227,6 +234,7 @@ describe("growth ops: full cycle", () => {
     await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r" }, fetchImpl: impl, log: () => {} });
     expect(posted[0].url).toBe("https://api.github.com/repos/o/r/issues");
     expect(posted[0].body.labels).toEqual(["growth-ops-alert"]);
+    expect(posted[0].body.body).toContain("<!-- growth-ops-alert:opslog-public-down -->");
     expect(loadState(dir).alerts.open["opslog-public-down"].issueNumber).toBe(7);
   });
 
@@ -338,3 +346,130 @@ describe("growth ops: review fixes", () => {
   });
 });
 
+
+describe("growth ops: round-two fixes", () => {
+  it("charges compute the way GitHub bills it: each job rounded up to a whole minute", async () => {
+    expect(billedSeconds(0)).toBe(120); // cycle job (setup only) + save job
+    expect(billedSeconds(30)).toBe(180);
+    expect(billedSeconds(61)).toBe(240);
+    const { impl } = fakeFetch(siteRoutes());
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "ops.self_check" });
+    // A cycle that takes no time is still billed two minutes, not 45 s.
+    expect(loadState(dir).budget.compute.secondsUsed).toBe(120);
+  });
+
+  it("charges the minimum before any task runs, so a cycle that dies is still counted", async () => {
+    let seenDuringRun = -1;
+    const routes = siteRoutes();
+    const impl = async (url: string) => {
+      if (seenDuringRun < 0) seenDuringRun = JSON.parse(readFileSync(join(dir, "state", "budget.json"), "utf8")).compute.secondsUsed;
+      return fakeFetch(routes).impl(url);
+    };
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "opslog.public_health" });
+    expect(seenDuringRun).toBe(120);
+  });
+
+  it("in GitHub Actions replaces a lock that came with the checkout without waiting or charging", async () => {
+    const t = new Date("2026-11-01T09:37:00Z");
+    writeFileSync(join(dir, "state", "lock.json"), JSON.stringify({ runId: "committed", at: new Date(t.valueOf() - 10 * 60000).toISOString() }));
+    const { impl } = fakeFetch(siteRoutes());
+    const r = await runCycle({ dir, now: () => t, env: { GITHUB_ACTIONS: "true" }, fetchImpl: impl, log: () => {}, only: "ops.self_check" });
+    expect(r.locked).toBeFalsy();
+    expect(r.results.length).toBe(1);
+    expect(loadState(dir).budget.compute.secondsUsed).toBe(120); // not 120 + 25 minutes
+  });
+
+  it("never runs a task that costs money from the scheduled runner, approved or not", () => {
+    const now = new Date("2026-11-02T09:00:00Z");
+    const task = { id: "x", priority: 2, costPence: 500 };
+    const approvals = [{ id: "A1", taskId: "x", status: "approved", amountPence: 500, expiresAt: "2026-12-01T00:00:00Z" }];
+    expect(runnerRefusal(task, { budget: { compute: null }, ledgerSummary: { capitalRemainingPence: 2000 }, approvals, control: {}, now })).toMatch(/never runs a task that costs money/);
+    expect(runnerRefusal({ ...task, costPence: 0 }, { budget: { compute: null }, ledgerSummary: {}, approvals: [], control: {}, now })).toBeNull();
+  });
+
+  it("does not write to the owner ledger during a cycle", async () => {
+    const f = paths(dir).ledger;
+    addEntry(f, { type: "revenue", amountPence: 60000, settled: true, evidence: "pi_3Qabc", counterparty: "CUST-001" }, new Date("2026-11-01T08:00:00Z"));
+    const before = readFileSync(f, "utf8");
+    const { impl } = fakeFetch(siteRoutes());
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {} });
+    expect(readFileSync(f, "utf8")).toBe(before);
+  });
+
+  it("reports a corrupt people-edited file without quoting what is in it", () => {
+    const f = join(dir, "pipeline", "prospects.json");
+    mkdirSync(join(dir, "pipeline"), { recursive: true });
+    writeFileSync(f, '{"prospects": [{"contact": jane.smith@example.com}]}');
+    expect(() => readJson(f, {})).toThrow(/Corrupt JSON/);
+    try {
+      readJson(f, {});
+    } catch (e: any) {
+      expect(e.message).not.toMatch(/jane|smith|example/);
+    }
+  });
+
+  it("never profiles a business marked do_not_contact or won, by FSA id or by name", async () => {
+    mkdirSync(join(dir, "pipeline"), { recursive: true });
+    writeFileSync(join(dir, "pipeline", "prospects.json"), JSON.stringify({ prospects: [
+      { id: "P-001", name: "Wee Bistro", stage: "do_not_contact", fhrsIds: [] },
+      { id: "P-002", name: "Something Else", stage: "won", fhrsIds: [105] },
+    ] }));
+    const { impl } = fakeFetch(siteRoutes());
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "market.fsa_refresh" });
+    const cands = JSON.parse(readFileSync(join(dir, "market", "candidates.json"), "utf8")).candidates;
+    const names = cands.map((c: any) => c.key);
+    expect(names).not.toContain("wee bistro"); // by name
+    expect(names).not.toContain("cafe and co"); // by FSA id 105
+    const summary = JSON.parse(readFileSync(join(dir, "market", "summary.json"), "utf8"));
+    expect(summary.excludedFromProfiling).toBe(2);
+    // The objection itself is kept: the prospects file is not rewritten.
+    expect(JSON.parse(readFileSync(join(dir, "pipeline", "prospects.json"), "utf8")).prospects[0].stage).toBe("do_not_contact");
+  });
+
+  it("keeps no names or addresses in the weekly comparison snapshot", async () => {
+    const { impl } = fakeFetch(siteRoutes());
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "market.fsa_refresh" });
+    const snap = JSON.parse(readFileSync(join(dir, "market", "establishments.json"), "utf8"));
+    expect(snap.establishments.length).toBeGreaterThan(0);
+    for (const e of snap.establishments) expect(Object.keys(e).sort()).toEqual(["id", "laId", "rating", "ratingDate", "typeId"]);
+  });
+
+  it("reuses an open alert issue instead of opening a duplicate, and waits when it cannot check", async () => {
+    const now = new Date("2026-11-01T09:37:00Z");
+    const alerts = { open: { k1: { key: "k1", title: "x", detail: "y", since: now.toISOString(), count: 1, issueNumber: null } }, closed: [] };
+    let posts = 0;
+    const listing = async (_u: string, o: any = {}) => ((o.method ?? "GET") === "GET"
+      ? { status: 200, text: JSON.stringify([{ number: 41, body: `old\n${issueMarker("k1")}` }]) }
+      : (posts++, { status: 201, text: JSON.stringify({ number: 42 }) }));
+    await syncIssues(alerts, { http: listing, token: "t", repo: "o/r" });
+    expect(posts).toBe(0);
+    expect(alerts.open.k1.issueNumber).toBe(41);
+
+    const alerts2 = { open: { k2: { key: "k2", title: "x", detail: "y", since: now.toISOString(), count: 1, issueNumber: null } }, closed: [] };
+    const listFails = async (_u: string, o: any = {}) => ((o.method ?? "GET") === "GET" ? { status: 502, text: "" } : (posts++, { status: 201, text: "{}" }));
+    await syncIssues(alerts2, { http: listFails, token: "t", repo: "o/r", log: () => {} });
+    expect(posts).toBe(0);
+    expect(alerts2.open.k2.issueNumber).toBeNull();
+  });
+
+  it("lets a large download take longer than the default request timeout", async () => {
+    const slow = async (_u: string, init: any) => {
+      await new Promise((r, j) => {
+        const t = setTimeout(r, 60);
+        init.signal?.addEventListener("abort", () => { clearTimeout(t); j(Object.assign(new Error("aborted"), { name: "AbortError" })); });
+      });
+      return new Response("ok", { status: 200 });
+    };
+    const http = makeHttp({ allowHosts: ["ratings.food.gov.uk"], timeoutMs: 10, fetchImpl: slow });
+    await expect(http("https://ratings.food.gov.uk/x")).rejects.toThrow(/Timed out after 10 ms/);
+    await expect(http("https://ratings.food.gov.uk/x", { timeoutMs: 1000 })).resolves.toMatchObject({ status: 200 });
+  });
+
+  it("accepts numeric payment references and refuses a bank reference that carries a name", () => {
+    expect(validateEntry({ type: "revenue", amountPence: 100, settled: true, evidence: "txn_1234567890", counterparty: "CUST-006" })).toEqual([]);
+    expect(validateEntry({ type: "revenue", amountPence: 100, settled: true, evidence: "bank:20261031-60000", counterparty: "CUST-006" })).toEqual([]);
+    expect(validateEntry({ type: "revenue", amountPence: 100, settled: true, evidence: "bank:FP JANE SMITH EH6", counterparty: "CUST-007" }).length).toBeGreaterThan(0);
+    expect(validateEntry({ type: "expense", amountPence: 100, category: "Jane Smith" }).length).toBeGreaterThan(0);
+    expect(validateEntry({ type: "expense", amountPence: 100, description: "x".repeat(121) }).length).toBeGreaterThan(0);
+  });
+});

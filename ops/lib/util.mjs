@@ -24,7 +24,10 @@ export function readJson(path, fallback) {
   try {
     return JSON.parse(text);
   } catch (err) {
-    throw new Error(`Corrupt JSON in ${path}: ${err.message}`);
+    // JSON.parse's message quotes the text around the fault, which for a
+    // people-edited file can be personal data. Report the place only.
+    const at = /position (\d+)/.exec(String(err?.message ?? ''));
+    throw new Error(`Corrupt JSON in ${path}${at ? ` near character ${at[1]}` : ''}`);
   }
 }
 
@@ -86,9 +89,13 @@ export function p(stateDir, ...parts) {
 
 // Anything that looks like an email address or a phone number. Used to
 // keep personal data out of records that should only hold pseudonyms.
+export function looksEmail(text) {
+  return typeof text === 'string' && /[^\s@]+@[^\s@]+\.[^\s@]+/.test(text);
+}
+
 export function looksPersonal(text) {
   if (typeof text !== 'string') return false;
-  if (/[^\s@]+@[^\s@]+\.[^\s@]+/.test(text)) return true;
+  if (looksEmail(text)) return true;
   if (/(\+?\d[\d\s().-]{8,}\d)/.test(text)) return true;
   return false;
 }
