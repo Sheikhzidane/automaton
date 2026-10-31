@@ -16,7 +16,7 @@ export async function run(ctx) {
     if (!res.ok) return { outcome: 'failed', note: `${a.name}: HTTP ${res.status}` };
     const parsed = parseFhrsXml(res.text);
     if (parsed.establishments.length === 0) return { outcome: 'failed', note: `${a.name}: no establishments parsed` };
-    const kept = parsed.establishments.filter((e) => keepTypes.has(e.typeId));
+    const kept = parsed.establishments.filter((e) => keepTypes.has(e.typeId)).map((e) => ({ ...e, laId: a.id }));
     perAuthority.push({ id: a.id, name: a.name, extractDate: parsed.extractDate, total: parsed.establishments.length, hospitality: kept.length });
     all.push(...kept);
   }
@@ -28,7 +28,15 @@ export async function run(ctx) {
   const firstSeen = readJson(firstSeenPath, {});
   const isFirstRun = prev.establishments.length === 0;
   const diff = diffEstablishments(prev.establishments, all);
-  for (const e of all) if (!firstSeen[e.id]) firstSeen[e.id] = isFirstRun ? (e.ratingDate ?? '1970-01-01') : ctx.now.toISOString().slice(0, 10);
+  // Businesses present in the first snapshot of an authority are the
+  // baseline: their inspection dates say nothing about when they opened.
+  // Only ids that appear later count as newly listed.
+  const knownAuthorities = new Set((prev.authorities ?? []).map((a) => a.id));
+  const BASELINE = '1970-01-01';
+  for (const e of all) {
+    if (firstSeen[e.id]) continue;
+    firstSeen[e.id] = isFirstRun || !knownAuthorities.has(e.laId) ? BASELINE : ctx.now.toISOString().slice(0, 10);
+  }
 
   const byRating = {};
   const byType = {};
@@ -42,7 +50,7 @@ export async function run(ctx) {
     chains: [...DEFAULT_CHAINS, ...m.chainExclusions],
     existingCustomers: m.existingCustomers,
     keep: m.keepCandidates,
-    firstSeen: isFirstRun ? {} : firstSeen,
+    firstSeen,
   });
 
   writeJsonAtomic(estPath, { at: ctx.now.toISOString(), authorities: perAuthority, establishments: all });

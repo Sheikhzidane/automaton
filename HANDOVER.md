@@ -94,7 +94,7 @@ Branch: `growth-ops-engine` (on top of `mission-mode-and-security-fixes`).
 (health checks of OpsLog's public pages, counts-only OpsLog metrics, weekly
 FSA open data refresh with prospect signals, pipeline, revenue and backlog
 reviews, daily report). Details and guarantees in `ops/README.md`.
-Tests: `src/__tests__/ops` (14) and `node ops/run.mjs verify-controls` (15).
+Tests: `src/__tests__/ops` (22) and `node ops/run.mjs verify-controls` (26).
 
 ## Why the schedule lives in the OpsLog repository
 

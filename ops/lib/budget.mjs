@@ -28,14 +28,23 @@ export function denyReason({ task, budget, ledgerSummary, approvals = [], contro
     return `Monthly compute cap of ${c.capMinutes} minutes reached; only priority-1 tasks run until next month`;
   }
   if (task.costPence > 0) {
+    const used = new Set(budget.approvalsUsed ?? []);
     const approval = approvals.find(
-      (a) => a.taskId === task.id && a.status === 'approved' && new Date(a.expiresAt).valueOf() > now.valueOf()
+      (a) => a.taskId === task.id && a.status === 'approved' && !used.has(a.id) && new Date(a.expiresAt).valueOf() > now.valueOf()
     );
-    if (!approval) return `Costs ${task.costPence}p and has no approval`;
+    if (!approval) return `Costs ${task.costPence}p and has no unused approval`;
     if (approval.amountPence < task.costPence) return `Approved for ${approval.amountPence}p but costs ${task.costPence}p`;
     if (task.costPence > (ledgerSummary?.capitalRemainingPence ?? 0)) {
       return `Costs ${task.costPence}p but only ${ledgerSummary?.capitalRemainingPence ?? 0}p of capital remains`;
     }
   }
   return null;
+}
+
+// The approval a costed task will use. Each approval is used once.
+export function approvalFor({ task, budget, approvals = [], now }) {
+  const used = new Set(budget.approvalsUsed ?? []);
+  return approvals.find(
+    (a) => a.taskId === task.id && a.status === 'approved' && !used.has(a.id) && new Date(a.expiresAt).valueOf() > now.valueOf()
+  ) ?? null;
 }

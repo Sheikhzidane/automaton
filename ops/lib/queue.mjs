@@ -157,28 +157,50 @@ export function dueTasks(tasks, now) {
     .sort((a, b) => a.priority - b.priority || String(a.nextRunAt ?? '').localeCompare(String(b.nextRunAt ?? '')));
 }
 
+// The start of the slot after the one `now` is in. Tasks are anchored
+// to slots, not to when they last finished, so a late GitHub start never
+// makes a task skip a cycle or drift around the clock.
+export function nextSlotStart(task, now) {
+  if (!task.intervalMinutes) return new Date(now);
+  const interval = minutes(task.intervalMinutes);
+  return new Date((Math.floor(now.valueOf() / interval) + 1) * interval);
+}
+
+function backoffAt(task, now) {
+  const interval = minutes(task.intervalMinutes || 0);
+  const backoff = Math.min(minutes(15) * 2 ** Math.max(0, task.attempts - 1), interval || minutes(15));
+  return new Date(now.valueOf() + backoff).toISOString();
+}
+
 // A task still marked running from an earlier cycle means that cycle
-// died. Count it as a failed attempt and let it run again.
+// died. It counts as a failed attempt, with the same retry limit as any
+// other failure. Returns the ids recovered and those now out of retries.
 export function recoverStale(tasks, now, runId) {
   const recovered = [];
+  const exhausted = [];
   for (const t of tasks) {
-    if (t.status === 'running' && t.lease && t.lease.runId !== runId) {
-      // Only one cycle runs at a time (workflow concurrency and the
-      // state lock), so any lease from another run is a dead one.
-      {
-        t.status = 'retrying';
-        t.attempts = (t.attempts ?? 0) + 1;
-        t.consecutiveFailures = (t.consecutiveFailures ?? 0) + 1;
-        t.lastOutcome = 'interrupted';
-        t.lastNote = `Interrupted: cycle ${t.lease.runId} stopped while this task was running`;
-        t.nextRunAt = now.toISOString();
-        t.lease = null;
-        pushHistory(t, { at: now.toISOString(), outcome: 'interrupted', ms: 0, note: t.lastNote });
-        recovered.push(t.id);
-      }
+    if (t.status !== 'running' || !t.lease || t.lease.runId === runId) continue;
+    // Only one cycle runs at a time (workflow concurrency and the state
+    // lock), so any lease from another run is a dead one.
+    const note = `Interrupted: cycle ${t.lease.runId} stopped while this task was running`;
+    t.lease = null;
+    t.lastOutcome = 'interrupted';
+    t.lastNote = note;
+    t.attempts = (t.attempts ?? 0) + 1;
+    t.consecutiveFailures = (t.consecutiveFailures ?? 0) + 1;
+    pushHistory(t, { at: now.toISOString(), outcome: 'interrupted', ms: 0, note });
+    if (t.attempts >= (t.maxAttempts ?? 1)) {
+      t.status = 'failed';
+      t.attempts = 0;
+      t.nextRunAt = nextSlotStart(t, now).toISOString();
+      exhausted.push(t.id);
+    } else {
+      t.status = 'retrying';
+      t.nextRunAt = backoffAt(t, now);
     }
+    recovered.push(t.id);
   }
-  return recovered;
+  return { recovered, exhausted };
 }
 
 export function startTask(task, now, runId) {
@@ -195,7 +217,6 @@ function pushHistory(task, entry) {
 // Returns true when the task has just used its last retry.
 export function finishTask(task, result, now, ms) {
   const at = now.toISOString();
-  const interval = minutes(task.intervalMinutes || 0);
   task.lease = null;
   task.lastOutcome = result.outcome;
   task.lastNote = result.note ?? null;
@@ -207,13 +228,13 @@ export function finishTask(task, result, now, ms) {
     task.attempts = 0;
     task.consecutiveFailures = 0;
     task.lastIdempotencyKey = slotKey(task, now);
-    task.nextRunAt = new Date(now.valueOf() + interval).toISOString();
+    task.nextRunAt = nextSlotStart(task, now).toISOString();
     return false;
   }
   if (result.outcome === 'blocked' || result.outcome === 'skipped') {
     task.status = result.outcome === 'blocked' ? 'blocked' : 'idle';
     task.attempts = 0;
-    task.nextRunAt = new Date(now.valueOf() + interval).toISOString();
+    task.nextRunAt = nextSlotStart(task, now).toISOString();
     return false;
   }
   // failed
@@ -221,12 +242,11 @@ export function finishTask(task, result, now, ms) {
   task.consecutiveFailures = (task.consecutiveFailures ?? 0) + 1;
   if (task.attempts < (task.maxAttempts ?? 1)) {
     task.status = 'retrying';
-    const backoff = Math.min(minutes(15) * 2 ** (task.attempts - 1), interval || minutes(15));
-    task.nextRunAt = new Date(now.valueOf() + backoff).toISOString();
+    task.nextRunAt = backoffAt(task, now);
     return false;
   }
   task.status = 'failed';
   task.attempts = 0;
-  task.nextRunAt = new Date(now.valueOf() + (interval || 0)).toISOString();
+  task.nextRunAt = nextSlotStart(task, now).toISOString();
   return true;
 }

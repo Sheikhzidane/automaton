@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // @ts-ignore plain ESM module without type declarations
 import { runCycle } from "../../../ops/lib/engine.mjs";
 // @ts-ignore
-import { initState, loadState, saveState, paths } from "../../../ops/lib/state.mjs";
+import { initState, loadState, saveState, saveOwnerFiles, paths } from "../../../ops/lib/state.mjs";
 // @ts-ignore
 import { nextCronTime } from "../../../ops/lib/cron.mjs";
 // @ts-ignore
@@ -15,7 +15,7 @@ import { addEntry, summarise, verifyChain } from "../../../ops/lib/ledger.mjs";
 // @ts-ignore
 import { readJsonl } from "../../../ops/lib/util.mjs";
 // @ts-ignore
-import { finishTask, isDue, reconcileTasks } from "../../../ops/lib/queue.mjs";
+import { finishTask, isDue, reconcileTasks, recoverStale } from "../../../ops/lib/queue.mjs";
 
 const FHRS = `<?xml version="1.0" encoding="utf-8"?>
 <FHRSEstablishment xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -112,9 +112,9 @@ describe("growth ops: ledger", () => {
   it("counts only settled, evidenced, unrelated, attributable revenue and subtracts every cost", () => {
     const f = paths(dir).ledger;
     const now = new Date("2026-11-01T10:00:00Z");
-    addEntry(f, { type: "revenue", amountPence: 60000, settled: true, evidence: "pi_1", counterparty: "CUST-001" }, now);
+    addEntry(f, { type: "revenue", amountPence: 60000, settled: true, evidence: "pi_3Qaa01", counterparty: "CUST-001" }, now);
     addEntry(f, { type: "revenue", amountPence: 60000, settled: false, counterparty: "CUST-002" }, now);
-    addEntry(f, { type: "revenue", amountPence: 200, settled: true, evidence: "in_old", relatedParty: true }, now);
+    addEntry(f, { type: "revenue", amountPence: 200, settled: true, evidence: "po_3Qold", relatedParty: true }, now);
     addEntry(f, { type: "expense", amountPence: 800, settled: true, evidence: "rcpt", fundedFromCapital: true, category: "compute_prepaid" }, now);
     addEntry(f, { type: "refund", amountPence: 1000, settled: true, evidence: "re_1" }, now);
     const s = summarise(readJsonl(f), { capitalPence: 2000, targetNetPence: 200000 });
@@ -129,7 +129,7 @@ describe("growth ops: ledger", () => {
   it("supersedes instead of editing, and detects deletion", () => {
     const f = paths(dir).ledger;
     const now = new Date("2026-11-01T10:00:00Z");
-    addEntry(f, { type: "revenue", amountPence: 5000, settled: true, evidence: "pi_x", counterparty: "CUST-009" }, now);
+    addEntry(f, { type: "revenue", amountPence: 5000, settled: true, evidence: "pi_3Qxx09", counterparty: "CUST-009" }, now);
     addEntry(f, { type: "correction", supersedes: 1, description: "entered twice" }, now);
     expect(summarise(readJsonl(f), { capitalPence: 2000, targetNetPence: 200000 }).countedRevenuePence).toBe(0);
     const lines = readFileSync(f, "utf8").trim().split("\n");
@@ -240,12 +240,13 @@ describe("growth ops: full cycle", () => {
   it("does nothing while paused and recovers a task interrupted by a crash", async () => {
     let s = loadState(dir);
     s.control = { paused: true, reason: "holiday" };
-    saveState(s);
+    saveOwnerFiles(s);
     const { impl } = fakeFetch(siteRoutes());
     const r = await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {} });
     expect(r.results).toHaveLength(0);
     s = loadState(dir);
     s.control = { paused: false };
+    saveOwnerFiles(s);
     const h = s.queue.tasks.find((t: any) => t.id === "opslog.public_health");
     h.status = "running";
     h.lease = { runId: "dead", at: "2026-11-01T06:37:00Z" };
@@ -254,3 +255,86 @@ describe("growth ops: full cycle", () => {
     expect(r2.results.find((x: any) => x.id === "opslog.public_health").outcome).toBe("succeeded");
   });
 });
+
+describe("growth ops: review fixes", () => {
+  it("accepts PostgREST timestamps with an offset", async () => {
+    const body = { generatedAt: "2026-11-01T09:37:01.123Z", orgs: { active: 3 }, email: { failed24h: 0, lastSentAt: "2026-11-01T07:00:04.846+00:00" }, licences: { byStatus: { active: 3 } } };
+    const { impl } = fakeFetch(siteRoutes({ "https://opslog.co.uk/api/ops/metrics": { status: 200, body: JSON.stringify(body) } }));
+    const r = await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: { OPS_METRICS_TOKEN: "a-long-enough-token-1234" }, fetchImpl: impl, log: () => {}, only: "opslog.ops_metrics" });
+    expect(r.results[0].outcome).toBe("succeeded");
+    expect(existsSync(join(dir, "metrics", "latest.json"))).toBe(true);
+  });
+
+  it("never stores a secret, even one with a line break in it", async () => {
+    const secret = "SECRETAAAAAAAAAA\nBBBBBBBBBBTAIL";
+    const { impl } = fakeFetch(siteRoutes());
+    const r = await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: { OPS_METRICS_TOKEN: secret }, fetchImpl: impl, log: () => {}, only: "opslog.ops_metrics" });
+    expect(r.results[0].outcome).toBe("failed");
+    const stored = readFileSync(join(dir, "state", "queue.json"), "utf8") + readFileSync(join(dir, "state", "runs.jsonl"), "utf8") + readFileSync(join(dir, "status.json"), "utf8");
+    expect(stored).not.toMatch(/SECRETAAAA|BBBBBBBBBBTAIL/);
+  });
+
+  it("keeps running health checks when the ledger file is malformed", async () => {
+    mkdirSync(join(dir, "ledger"), { recursive: true });
+    writeFileSync(paths(dir).ledger, "{not json\n");
+    const { impl } = fakeFetch(siteRoutes());
+    const r = await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {} });
+    const byId = Object.fromEntries(r.results.map((x: any) => [x.id, x.outcome]));
+    expect(byId["opslog.public_health"]).toBe("succeeded");
+    expect(byId["ops.self_check"]).toBe("failed");
+    expect(Object.keys(loadState(dir).alerts.open)).toContain("ledger-damaged");
+    expect(JSON.parse(readFileSync(join(dir, "status.json"), "utf8")).budget.ledgerError).toMatch(/Corrupt/);
+  });
+
+  it("detects lines removed from the end after a cycle has recorded the head", async () => {
+    const f = paths(dir).ledger;
+    const t = new Date("2026-11-01T08:00:00Z");
+    addEntry(f, { type: "revenue", amountPence: 5000, settled: true, evidence: "pi_3Qend1", counterparty: "CUST-001" }, t);
+    addEntry(f, { type: "expense", amountPence: 1500, settled: true, evidence: "rcpt-1", fundedFromCapital: true }, t);
+    const { impl } = fakeFetch(siteRoutes());
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {} });
+    const lines = readFileSync(f, "utf8").trim().split("\n");
+    writeFileSync(f, `${lines[0]}\n`);
+    const r = await runCycle({ dir, now: () => new Date("2026-11-01T12:37:00Z"), env: {}, fetchImpl: impl, log: () => {} });
+    expect(r.results.find((x: any) => x.id === "ops.self_check").outcome).toBe("failed");
+  });
+
+  it("refuses duplicate evidence and lets a correction be undone", () => {
+    const f = paths(dir).ledger;
+    const t = new Date("2026-11-01T10:00:00Z");
+    addEntry(f, { type: "revenue", amountPence: 60000, settled: true, evidence: "pi_3QdupA", counterparty: "CUST-001" }, t);
+    expect(() => addEntry(f, { type: "revenue", amountPence: 60000, settled: true, evidence: "pi_3QdupA", counterparty: "CUST-001" }, t)).toThrow(/already recorded/);
+    addEntry(f, { type: "correction", supersedes: 1, description: "wrong venue" }, t);
+    addEntry(f, { type: "correction", supersedes: 2, description: "the first correction was a mistake" }, t);
+    expect(summarise(readJsonl(f), { capitalPence: 2000, targetNetPence: 200000 }).countedRevenuePence).toBe(60000);
+    expect(() => addEntry(f, { type: "correction", supersedes: 9 }, t)).toThrow(/existing earlier line/);
+  });
+
+  it("counts capital spent even on a cost that is not attributable", () => {
+    const f = paths(dir).ledger;
+    addEntry(f, { type: "expense", amountPence: 1800, evidence: "rcpt-2", fundedFromCapital: true, attributable: false }, new Date());
+    const s = summarise(readJsonl(f), { capitalPence: 2000, targetNetPence: 200000 });
+    expect(s.capitalRemainingPence).toBe(200);
+    expect(s.expensesPence).toBe(0);
+  });
+
+  it("does not call long-established businesses newly listed after the first snapshot", async () => {
+    const { impl } = fakeFetch(siteRoutes());
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "market.fsa_refresh" });
+    await runCycle({ dir, now: () => new Date("2026-11-08T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "market.fsa_refresh" });
+    const cands = JSON.parse(readFileSync(join(dir, "market", "candidates.json"), "utf8")).candidates;
+    // Wee Bistro was re-inspected on 2026-09-01; that is not an opening.
+    const wee = cands.find((c: any) => c.key === "wee bistro");
+    expect(wee.signals.join(" ")).not.toMatch(/newly listed/);
+  });
+
+  it("escalates a task that keeps killing its cycle", () => {
+    const now = new Date("2026-11-01T10:00:00Z");
+    const tasks: any[] = [{ id: "x", status: "running", maxAttempts: 2, attempts: 1, intervalMinutes: 10080, lease: { runId: "dead", at: now.toISOString() }, history: [] }];
+    const r = recoverStale(tasks, now, "new");
+    expect(r.exhausted).toEqual(["x"]);
+    expect(tasks[0].status).toBe("failed");
+    expect(new Date(tasks[0].nextRunAt).valueOf()).toBeGreaterThan(now.valueOf());
+  });
+});
+

@@ -7,7 +7,9 @@ import { appendJsonl, trimJsonl, writeJsonAtomic, p } from '../lib/util.mjs';
 function onlyNumbersAndDates(value, path = 'metrics') {
   if (value === null || typeof value === 'number' || typeof value === 'boolean') return null;
   if (typeof value === 'string') {
-    return /^\d{4}-\d{2}-\d{2}(T[\d:.]+Z?)?$/.test(value) || /^[a-z0-9_.:-]{1,40}$/i.test(value) ? null : `${path} holds free text`;
+    // ISO-8601 dates and timestamps, including PostgREST's "+00:00" offsets.
+    const isoDate = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+    return isoDate.test(value) || /^[a-z0-9_.:-]{1,40}$/i.test(value) ? null : `${path} holds free text`;
   }
   if (Array.isArray(value)) return `${path} is a list`;
   for (const [k, v] of Object.entries(value)) {

@@ -1,5 +1,11 @@
 // Where everything the engine knows is kept, and the lock that stops
 // two cycles running over the same state at once.
+//
+// Ownership matters because people edit the same branch the scheduled
+// run commits to. The engine writes only ENGINE_OWNED paths; config,
+// control (the kill switch), approvals, memory (next action, strategy),
+// the ledger, the pipeline and the backlog belong to people and are
+// only ever read by a cycle.
 
 import { existsSync, rmSync } from 'node:fs';
 import { readJson, writeJsonAtomic, p } from './util.mjs';
@@ -39,9 +45,27 @@ export const DEFAULT_CONFIG = {
   alerts: { githubIssues: true, label: 'growth-ops-alert' },
 };
 
+export const ENGINE_OWNED = [
+  'status.json',
+  'state/queue.json',
+  'state/budget.json',
+  'state/alerts.json',
+  'state/engine.json',
+  'state/runs.jsonl',
+  'state/cycles.jsonl',
+  'health',
+  'metrics',
+  'market',
+  'reports',
+  'pipeline/summary.json',
+  'ledger/summary.json',
+  'work/summary.json',
+];
+
 export function paths(dir) {
   return {
     config: p(dir, 'config.json'),
+    engine: p(dir, 'state', 'engine.json'),
     queue: p(dir, 'state', 'queue.json'),
     budget: p(dir, 'state', 'budget.json'),
     control: p(dir, 'state', 'control.json'),
@@ -73,7 +97,8 @@ export function loadState(dir) {
     files: f,
     config,
     queue,
-    budget: readJson(f.budget, { capitalPence: config.mission.capitalPence, compute: null }),
+    budget: readJson(f.budget, { compute: null, approvalsUsed: [] }),
+    engine: readJson(f.engine, { cyclesTotal: 0, lastCycleAt: null, ledgerHead: null }),
     control: readJson(f.control, { paused: false, reason: null }),
     alerts: readJson(f.alerts, emptyAlerts()),
     approvals: readJson(f.approvals, { approvals: [] }),
@@ -81,11 +106,17 @@ export function loadState(dir) {
   };
 }
 
+// Writes only what the engine owns.
 export function saveState(s) {
   writeJsonAtomic(s.files.queue, s.queue);
   writeJsonAtomic(s.files.budget, s.budget);
-  writeJsonAtomic(s.files.control, s.control);
   writeJsonAtomic(s.files.alerts, s.alerts);
+  writeJsonAtomic(s.files.engine, s.engine);
+}
+
+// People's files, written only by explicit commands (init, pause, resume).
+export function saveOwnerFiles(s) {
+  writeJsonAtomic(s.files.control, s.control);
   writeJsonAtomic(s.files.approvals, s.approvals);
   writeJsonAtomic(s.files.memory, s.memory);
 }
@@ -95,6 +126,9 @@ export function initState(dir, overrides = {}) {
   if (!existsSync(f.config)) writeJsonAtomic(f.config, deepMerge(DEFAULT_CONFIG, overrides));
   const s = loadState(dir);
   saveState(s);
+  for (const [file, value] of [[f.control, s.control], [f.approvals, s.approvals], [f.memory, s.memory]]) {
+    if (!existsSync(file)) writeJsonAtomic(file, value);
+  }
   return s;
 }
 
