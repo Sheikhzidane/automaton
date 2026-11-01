@@ -423,6 +423,8 @@ describe("growth ops: round-two fixes", () => {
     writeFileSync(join(dir, "pipeline", "prospects.json"), JSON.stringify({ prospects: [
       { id: "P-001", name: "Wee Bistro", stage: "do_not_contact", fhrsIds: [] },
       { id: "P-002", name: "Something Else", stage: "won", fhrsIds: [105] },
+      { id: "P-003", name: "Paid Up", stage: "paid", fhrsIds: [] },
+      { id: "P-004", name: "Live Venue", stage: "onboarded", fhrsIds: [] },
     ] }));
     const { impl } = fakeFetch(siteRoutes());
     await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "market.fsa_refresh" });
@@ -431,7 +433,7 @@ describe("growth ops: round-two fixes", () => {
     expect(names).not.toContain("wee bistro"); // by name
     expect(names).not.toContain("cafe and co"); // by FSA id 105
     const summary = JSON.parse(readFileSync(join(dir, "market", "summary.json"), "utf8"));
-    expect(summary.excludedFromProfiling).toBe(2);
+    expect(summary.excludedFromProfiling).toBe(4);
     // The objection itself is kept: the prospects file is not rewritten.
     expect(JSON.parse(readFileSync(join(dir, "pipeline", "prospects.json"), "utf8")).prospects[0].stage).toBe("do_not_contact");
   });
@@ -571,5 +573,27 @@ describe("growth ops: round-three fixes", () => {
     const text = readFileSync(join(dir, "pipeline", "summary.json"), "utf8");
     expect(text).not.toMatch(/Hill Bistro|Dale Cafe|Jane|07700/);
     expect(JSON.parse(text).due[0].id).toBe("P-001");
+  });
+
+  it("tracks the full acquisition pipeline: proposal, signed, paid, onboarded", async () => {
+    mkdirSync(join(dir, "pipeline"), { recursive: true });
+    writeFileSync(join(dir, "pipeline", "prospects.json"), JSON.stringify({ prospects: [
+      { id: "P-001", stage: "proposal_sent", lastTouch: "2026-09-01" },
+      { id: "P-002", stage: "won", lastTouch: "2026-09-01", nextActionDue: "2026-10-30" },
+      { id: "P-003", stage: "paid", lastTouch: "2026-10-30" },
+      { id: "P-004", stage: "onboarded", lastTouch: "2026-09-01" },
+      { id: "P-005", stage: "lost", nextActionDue: "2026-10-01" },
+      { id: "P-006", stage: "trial" },
+    ] }));
+    const { impl } = fakeFetch(siteRoutes());
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "pipeline.review" });
+    const sum = JSON.parse(readFileSync(join(dir, "pipeline", "summary.json"), "utf8"));
+    expect(sum.byStage).toMatchObject({ proposal_sent: 1, won: 1, paid: 1, onboarded: 1, lost: 1 });
+    // A signed but unpaid customer still has actions due; a lost one never does.
+    expect(sum.due.map((d: any) => d.id)).toEqual(["P-002"]);
+    // Untouched proposals and unpaid signings go stale; a live customer does not.
+    expect(sum.stale.map((d: any) => d.id)).toEqual(["P-001", "P-002"]);
+    // There is no free-trial stage: OpsLog offers no free periods.
+    expect(sum.problems).toEqual(["P-006: unknown stage"]);
   });
 });

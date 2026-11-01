@@ -76,8 +76,14 @@ next action; the daily report quotes the next action from `state/memory.json`.
   one where none exists, and closes duplicates and any issue whose problem
   has cleared, including one opened by a run whose state was never saved.
   If the list cannot be read, nothing is opened or closed that run.
-- **Objections are honoured.** A prospect marked `do_not_contact` (or `won`)
-  in `pipeline/prospects.json` is never profiled again: matched by FSA id
+- **Pipeline stages**, in order: `researched`, `qualified`,
+  `approved_to_contact`, `contacted`, `replied`, `demo_booked`,
+  `proposal_sent`, `won` (signed), `paid`, `onboarded`; plus `lost` and
+  `do_not_contact`. Any other stage fails the review. There is no trial
+  stage: OpsLog offers no free periods.
+- **Objections are honoured.** A prospect marked `do_not_contact` (or any
+  customer stage: `won`, `paid`, `onboarded`) in `pipeline/prospects.json`
+  is never profiled again: matched by FSA id
   (`fhrsIds`) and by normalised business name. Keep the record, with its
   stage, as the suppression entry; deleting it would let the business back in.
 - **Secrets.** Header values with line breaks are refused, error text never

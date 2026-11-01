@@ -4,6 +4,7 @@
 
 import { appendJsonl, readJson, writeJsonAtomic, trimJsonl, p } from '../lib/util.mjs';
 import { parseFhrsXml, buildCandidates, diffEstablishments, DEFAULT_CHAINS } from '../lib/fhrs.mjs';
+import { CUSTOMER_STAGES } from './pipeline-review.mjs';
 
 export async function run(ctx) {
   const m = ctx.s.config.market;
@@ -44,9 +45,9 @@ export async function run(ctx) {
     byRating[e.rating ?? 'none'] = (byRating[e.rating ?? 'none'] ?? 0) + 1;
     byType[e.type] = (byType[e.type] ?? 0) + 1;
   }
-  // Never re-profile people who objected, or businesses already won.
+  // Never re-profile people who objected, or businesses already signed.
   const pipeline = readJson(p(ctx.s.dir, 'pipeline', 'prospects.json'), { prospects: [] });
-  const shut = (pipeline.prospects ?? []).filter((x) => ['do_not_contact', 'won'].includes(x.stage));
+  const shut = (pipeline.prospects ?? []).filter((x) => x.stage === 'do_not_contact' || CUSTOMER_STAGES.includes(x.stage));
   const exclude = {
     names: shut.map((x) => x.name).filter(Boolean),
     ids: shut.flatMap((x) => x.fhrsIds ?? []),
