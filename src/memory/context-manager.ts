@@ -8,6 +8,37 @@ import { getEncoding, type Tiktoken } from "js-tiktoken";
 import type { ChatMessage } from "../types.js";
 
 const MAX_TOKEN_CACHE_SIZE = 10_000;
+
+// cl100k's BPE (js-tiktoken) is quadratic in the length of a run of one
+// repeated character: 16,000 'x' took 24 s and 500,000 would take hours,
+// freezing the agent loop on any long blob in a tool result or input.
+// Runs longer than REPEAT_SLICE are counted slice by slice, which gives
+// the same total for such runs; texts longer than MAX_EXACT_CHARS use the
+// conservative character estimate and are not cached under their text.
+const MAX_EXACT_CHARS = 32_000;
+const REPEAT_SLICE = 64;
+const LONG_REPEAT = new RegExp(`([\\s\\S])\\1{${REPEAT_SLICE},}`, "g");
+
+function conservativeEstimate(text: string): number {
+  return Math.ceil(text.length / 3.5);
+}
+
+export function countTokensBounded(encoder: Tiktoken, text: string): number {
+  if (text.length > MAX_EXACT_CHARS) return conservativeEstimate(text);
+  let total = 0;
+  let last = 0;
+  for (const match of text.matchAll(LONG_REPEAT)) {
+    const start = match.index ?? 0;
+    if (start > last) total += encoder.encode(text.slice(last, start)).length;
+    const run = match[0];
+    for (let i = 0; i < run.length; i += REPEAT_SLICE) {
+      total += encoder.encode(run.slice(i, i + REPEAT_SLICE)).length;
+    }
+    last = start + run.length;
+  }
+  if (last < text.length) total += encoder.encode(text.slice(last)).length;
+  return total;
+}
 const DEFAULT_RESERVE_TOKENS = 4_096;
 const COMPRESSION_HEADROOM_RATIO = 0.1;
 const MAX_EVENT_CONTENT_CHARS = 220;
@@ -140,6 +171,7 @@ export function createTokenCounter(): TokenCounter {
 
   const countTokens = (text: string, model?: string): number => {
     const normalizedText = text ?? "";
+    if (normalizedText.length > MAX_EXACT_CHARS) return conservativeEstimate(normalizedText);
     const key = formatCacheKey(normalizedText, model);
 
     const cached = cache.get(key);
@@ -152,12 +184,12 @@ export function createTokenCounter(): TokenCounter {
     let count: number;
     if (encoder) {
       try {
-        count = encoder.encode(normalizedText).length;
+        count = countTokensBounded(encoder, normalizedText);
       } catch {
-        count = Math.ceil(normalizedText.length / 3.5);
+        count = conservativeEstimate(normalizedText);
       }
     } else {
-      count = Math.ceil(normalizedText.length / 3.5);
+      count = conservativeEstimate(normalizedText);
     }
 
     cache.set(key, count);
