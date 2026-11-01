@@ -3,7 +3,7 @@
 // external (clock, HTTP, environment) is injected so tests can drive it.
 
 import { appendJsonl, readJsonl, trimJsonl, writeJsonAtomic, newId, readJson } from './util.mjs';
-import { loadState, saveState, acquireLock, releaseLock } from './state.mjs';
+import { loadState, saveState, acquireLock, releaseLock, paths } from './state.mjs';
 import { dueTasks, recoverStale, startTask, finishTask } from './queue.mjs';
 import { denyReason, recordCompute, computeAllowance, billedSeconds } from './budget.mjs';
 import { raise, resolve, syncIssues } from './alerts.mjs';
@@ -97,9 +97,21 @@ export async function runCycle({ dir, now = () => new Date(), env = process.env,
   const runId = env.GITHUB_RUN_ID ? `gh_${env.GITHUB_RUN_ID}_${env.GITHUB_RUN_ATTEMPT ?? 1}` : newId('local');
   const redact = redactor(env);
   const say = (level, message, extra) => log(level, redact(message), extra ? JSON.parse(redact(JSON.stringify(extra))) : undefined);
-  const s = loadState(dir);
+  // GitHub bills runs in Actions; a run on a laptop costs no Actions minutes.
+  const billed = Boolean(env.GITHUB_ACTIONS);
+  const jobStartedMs = Number(env.GROWTH_OPS_JOB_STARTED_AT) > 0 ? Number(env.GROWTH_OPS_JOB_STARTED_AT) * 1000 : null;
+  const jobSeconds = (at) => (jobStartedMs ? (at.valueOf() - jobStartedMs) / 1000 : null);
+  let s;
+  try {
+    s = loadState(dir);
+  } catch (err) {
+    // A people-edited file that cannot be read stops the cycle, but the
+    // run is still billed: charge its minimum in the engine's own file.
+    if (billed) chargeMinimumOnly(dir, started, jobSeconds(started));
+    throw err;
+  }
   const staleLock = readJson(s.files.lock, null);
-  const lock = acquireLock(s, runId, started, { fresh: Boolean(env.GITHUB_ACTIONS) });
+  const lock = acquireLock(s, runId, started, { fresh: billed });
   if (!lock.ok) {
     say('warn', 'another cycle holds the lock; exiting', { heldBy: lock.heldBy, since: lock.since });
     return { ok: false, locked: true, runId, results: [] };
@@ -116,18 +128,16 @@ export async function runCycle({ dir, now = () => new Date(), env = process.env,
   try {
     if (lock.replacedFromCheckout) {
       // Committed by mistake (state/lock.json is git-ignored). Not a dead
-      // run here: a run that dies in Actions was charged when it started.
-      say('warn', 'a lock file came with the checkout; replaced it without charging', { previous: staleLock?.runId ?? null });
-    } else if (lock.replacedStale && staleLock?.at) {
-      // A local cycle that died: it used time the cap never saw.
-      const lost = Math.min(Math.max(0, started.valueOf() - new Date(staleLock.at).valueOf()) / 1000, 25 * 60);
-      recordCompute(s.budget, started, billedSeconds(lost, s.config.compute));
-      say('warn', 'replaced a stale lock from a cycle that did not finish', { previous: staleLock.runId, estimatedSeconds: Math.round(lost) });
+      // run: a run that dies in Actions was charged when it started.
+      say('warn', 'a lock file came with the checkout; replaced it', { previous: staleLock?.runId ?? null });
+    } else if (lock.replacedStale) {
+      // A local cycle that died. Local runs use no Actions minutes.
+      say('warn', 'replaced a stale lock from a cycle that did not finish', { previous: staleLock?.runId ?? null });
     }
     // Charge the least this run can be billed now, so a cycle that dies
     // part-way is still counted; the rest is added when it finishes.
-    const minimumBilled = billedSeconds(0, s.config.compute);
-    recordCompute(s.budget, started, minimumBilled);
+    const minimumBilled = billed ? billedSeconds(0, s.config.compute, jobSeconds(started)) : 0;
+    if (billed) recordCompute(s.budget, started, minimumBilled);
     saveState(s);
     const { recovered, exhausted } = recoverStale(s.queue.tasks, started, runId);
     if (recovered.length) say('warn', 'recovered tasks from an interrupted cycle', { recovered });
@@ -209,17 +219,30 @@ export async function runCycle({ dir, now = () => new Date(), env = process.env,
       // unreadable: self_check has already raised it
     }
 
+    cycle.ok = !results.some((r) => r.outcome === 'failed');
+    if (s.config.alerts.githubIssues) {
+      cycle.alertSync = await syncIssues(s.alerts, {
+        http,
+        token: env.GITHUB_TOKEN,
+        repo: env.GITHUB_REPOSITORY,
+        label: s.config.alerts.label,
+        author: billed ? 'github-actions[bot]' : null,
+        now: now(),
+        log: say,
+      });
+    }
+    // Measured after the alert sync, which can make several API calls.
     const finished = now();
-    recordCompute(s.budget, finished, billedSeconds((finished.valueOf() - started.valueOf()) / 1000, s.config.compute) - minimumBilled);
+    if (billed) {
+      const total = billedSeconds((finished.valueOf() - started.valueOf()) / 1000, s.config.compute, jobSeconds(finished));
+      recordCompute(s.budget, finished, Math.max(0, total - minimumBilled));
+    }
+    s.budget.compute = computeAllowance(s.budget, finished);
     s.budget.compute.capMinutes = s.config.compute.monthlyMinutesCap;
     s.engine.cyclesTotal = (s.engine.cyclesTotal ?? 0) + 1;
     s.engine.lastCycleAt = cycle.startedAt;
     if (cycle.trigger === 'schedule') s.engine.lastScheduledCycleAt = cycle.startedAt;
     cycle.finishedAt = finished.toISOString();
-    cycle.ok = !results.some((r) => r.outcome === 'failed');
-    if (s.config.alerts.githubIssues) {
-      cycle.alertSync = await syncIssues(s.alerts, { http, token: env.GITHUB_TOKEN, repo: env.GITHUB_REPOSITORY, label: s.config.alerts.label, log: say });
-    }
     saveState(s);
     writeJsonAtomic(s.files.status, buildStatus(s, { now: finished, cycle }));
     appendJsonl(s.files.cycles, { ...cycle, results: results.map(({ id, outcome, ms }) => ({ id, outcome, ms })) });
@@ -228,6 +251,20 @@ export async function runCycle({ dir, now = () => new Date(), env = process.env,
     return { ok: cycle.ok, runId, results };
   } finally {
     releaseLock(s, runId);
+  }
+}
+
+// The engine's own budget file, written when the people-owned files could
+// not be read, so a run that stopped at once is still counted.
+function chargeMinimumOnly(dir, at, jobSecondsSoFar) {
+  try {
+    const f = paths(dir).budget;
+    const budget = readJson(f, { compute: null });
+    const config = readJson(paths(dir).config, {});
+    recordCompute(budget, at, billedSeconds(0, config?.compute ?? {}, jobSecondsSoFar));
+    writeJsonAtomic(f, budget);
+  } catch {
+    // the budget file itself is unreadable: nothing more can be done here
   }
 }
 

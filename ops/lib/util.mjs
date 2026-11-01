@@ -93,9 +93,24 @@ export function looksEmail(text) {
   return typeof text === 'string' && /[^\s@]+@[^\s@]+\.[^\s@]+/.test(text);
 }
 
+// A UK or international phone number: 0 then 9-10 more digits, or +44
+// then 10, or + then 9-14 others, once spaces, dots, dashes and brackets
+// are removed. A date (2026-11-01) or a reference such as INV-2026-000123
+// is not one.
+export function looksPhone(text) {
+  if (typeof text !== 'string') return false;
+  for (const m of text.matchAll(/\+?\d[\d\s().-]{7,}\d/g)) {
+    const raw = m[0];
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw.trim())) continue;
+    const digits = raw.replace(/\D/g, '');
+    if (raw.startsWith('+') && digits.length >= 10 && digits.length <= 15) return true;
+    if (digits.startsWith('44') && digits.length === 12) return true;
+    if (digits.startsWith('0') && (digits.length === 10 || digits.length === 11)) return true;
+  }
+  return false;
+}
+
 export function looksPersonal(text) {
   if (typeof text !== 'string') return false;
-  if (looksEmail(text)) return true;
-  if (/(\+?\d[\d\s().-]{8,}\d)/.test(text)) return true;
-  return false;
+  return looksEmail(text) || looksPhone(text);
 }

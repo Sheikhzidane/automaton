@@ -19,6 +19,8 @@ import { billedSeconds } from "../../../ops/lib/budget.mjs";
 // @ts-ignore
 import { syncIssues, issueMarker } from "../../../ops/lib/alerts.mjs";
 // @ts-ignore
+import { looksPhone } from "../../../ops/lib/util.mjs";
+// @ts-ignore
 import { makeHttp } from "../../../ops/lib/http.mjs";
 // @ts-ignore
 import { finishTask, isDue, reconcileTasks, recoverStale } from "../../../ops/lib/queue.mjs";
@@ -349,13 +351,21 @@ describe("growth ops: review fixes", () => {
 
 describe("growth ops: round-two fixes", () => {
   it("charges compute the way GitHub bills it: each job rounded up to a whole minute", async () => {
-    expect(billedSeconds(0)).toBe(120); // cycle job (setup only) + save job
-    expect(billedSeconds(30)).toBe(180);
-    expect(billedSeconds(61)).toBe(240);
+    expect(billedSeconds(0)).toBe(120); // cycle job + save job, a minute each
+    expect(billedSeconds(30)).toBe(120);
+    expect(billedSeconds(31)).toBe(180);
+    expect(billedSeconds(0, {}, 40)).toBe(180); // 40 s of job so far + 25 s of steps after the engine
+    const { impl } = fakeFetch(siteRoutes());
+    const t = new Date("2026-11-01T09:37:00Z");
+    await runCycle({ dir, now: () => t, env: { GITHUB_ACTIONS: "true", GROWTH_OPS_JOB_STARTED_AT: String(t.valueOf() / 1000 - 20) }, fetchImpl: impl, log: () => {}, only: "ops.self_check" });
+    // 20 s of checkout and Node, a short cycle, 25 s after: one minute, plus the save job.
+    expect(loadState(dir).budget.compute.secondsUsed).toBe(120);
+  });
+
+  it("charges nothing for a cycle run on a laptop, which uses no Actions minutes", async () => {
     const { impl } = fakeFetch(siteRoutes());
     await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "ops.self_check" });
-    // A cycle that takes no time is still billed two minutes, not 45 s.
-    expect(loadState(dir).budget.compute.secondsUsed).toBe(120);
+    expect(loadState(dir).budget.compute.secondsUsed).toBe(0);
   });
 
   it("charges the minimum before any task runs, so a cycle that dies is still counted", async () => {
@@ -365,7 +375,7 @@ describe("growth ops: round-two fixes", () => {
       if (seenDuringRun < 0) seenDuringRun = JSON.parse(readFileSync(join(dir, "state", "budget.json"), "utf8")).compute.secondsUsed;
       return fakeFetch(routes).impl(url);
     };
-    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "opslog.public_health" });
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: { GITHUB_ACTIONS: "true" }, fetchImpl: impl, log: () => {}, only: "opslog.public_health" });
     expect(seenDuringRun).toBe(120);
   });
 
@@ -471,5 +481,95 @@ describe("growth ops: round-two fixes", () => {
     expect(validateEntry({ type: "revenue", amountPence: 100, settled: true, evidence: "bank:FP JANE SMITH EH6", counterparty: "CUST-007" }).length).toBeGreaterThan(0);
     expect(validateEntry({ type: "expense", amountPence: 100, category: "Jane Smith" }).length).toBeGreaterThan(0);
     expect(validateEntry({ type: "expense", amountPence: 100, description: "x".repeat(121) }).length).toBeGreaterThan(0);
+  });
+});
+
+describe("growth ops: round-three fixes", () => {
+  const BOT = { login: "github-actions[bot]" };
+  function github(issues: any[], opts: { failList?: boolean } = {}) {
+    const calls: string[] = [];
+    const http = async (url: string, o: any = {}) => {
+      const method = o.method ?? "GET";
+      calls.push(`${method} ${url.replace("https://api.github.com/repos/o/r", "")}`);
+      if (method === "GET") {
+        if (opts.failList) return { status: 502, text: "" };
+        const page = Number(new URL(url).searchParams.get("page") ?? 1);
+        return { status: 200, text: JSON.stringify(issues.slice((page - 1) * 100, page * 100)) };
+      }
+      if (method === "POST" && url.endsWith("/issues")) return { status: 201, text: JSON.stringify({ number: 900 }) };
+      return { status: 200, text: "{}" };
+    };
+    return { http, calls };
+  }
+  const alert = (key: string) => ({ key, title: "t", detail: "d", since: "2026-11-01T00:00:00Z", count: 1, issueNumber: null });
+
+  it("finds an alert issue beyond the first page, and never adopts a pull request or a stranger's issue", async () => {
+    const filler = Array.from({ length: 130 }, (_, i) => ({ number: 1000 - i, body: "unrelated", user: { login: "someone" } }));
+    const issues = [
+      ...filler,
+      { number: 52, body: `copied ${issueMarker("k1")}`, user: BOT, pull_request: {} },
+      { number: 60, body: `pasted ${issueMarker("k1")}`, user: { login: "someone" } },
+      { number: 41, body: `real ${issueMarker("k1")}`, user: BOT },
+    ];
+    const { http, calls } = github(issues);
+    const alerts = { open: { k1: alert("k1") }, closed: [] };
+    await syncIssues(alerts, { http, token: "t", repo: "o/r", author: BOT.login });
+    expect(alerts.open.k1.issueNumber).toBe(41);
+    expect(calls.filter((c) => c.startsWith("GET")).length).toBe(2);
+    expect(calls.some((c) => c.startsWith("POST /issues "))).toBe(false);
+    expect(calls.some((c) => c.includes("/issues/52") || c.includes("/issues/60"))).toBe(false);
+  });
+
+  it("closes an issue whose alert cleared in a run that was never saved, and closes duplicates", async () => {
+    const issues = [
+      { number: 41, body: issueMarker("site-down"), user: BOT },
+      { number: 45, body: issueMarker("k2"), user: BOT },
+      { number: 47, body: issueMarker("k2"), user: BOT },
+    ];
+    const { http, calls } = github(issues);
+    const alerts = { open: { k2: alert("k2") }, closed: [] };
+    await syncIssues(alerts, { http, token: "t", repo: "o/r", author: BOT.login, now: new Date("2026-11-02T00:00:00Z") });
+    expect(alerts.open.k2.issueNumber).toBe(45);
+    expect(calls).toContain("PATCH /issues/41");
+    expect(calls).toContain("PATCH /issues/47");
+    expect(calls).not.toContain("PATCH /issues/45");
+  });
+
+  it("opens and closes nothing when the issue list cannot be read", async () => {
+    const { http, calls } = github([], { failList: true });
+    const alerts = { open: { k3: alert("k3") }, closed: [] };
+    await syncIssues(alerts, { http, token: "t", repo: "o/r", author: BOT.login, log: () => {} });
+    expect(calls.filter((c) => !c.startsWith("GET"))).toEqual([]);
+  });
+
+  it("still charges a run whose people-edited files cannot be read", async () => {
+    writeFileSync(join(dir, "state", "control.json"), '{"paused": true,}');
+    const { impl } = fakeFetch(siteRoutes());
+    await expect(runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: { GITHUB_ACTIONS: "true" }, fetchImpl: impl, log: () => {} })).rejects.toThrow(/Corrupt JSON/);
+    expect(JSON.parse(readFileSync(join(dir, "state", "budget.json"), "utf8")).compute.secondsUsed).toBe(120);
+  });
+
+  it("keeps phone numbers out of every kind of ledger evidence, and lets dates through descriptions", () => {
+    expect(validateEntry({ type: "expense", amountPence: 100, evidence: "paid to Jane Smith 07700 900123" }).length).toBeGreaterThan(0);
+    expect(validateEntry({ type: "refund", amountPence: 100, evidence: "refund to +44 7700 900123" }).length).toBeGreaterThan(0);
+    expect(validateEntry({ type: "revenue", amountPence: 100, settled: true, test: true, evidence: "Jane 07700900123" }).length).toBeGreaterThan(0);
+    expect(validateEntry({ type: "revenue", amountPence: 100, settled: true, evidence: "bank:JANE.SMITH", counterparty: "CUST-001" }).length).toBeGreaterThan(0);
+    expect(validateEntry({ type: "expense", amountPence: 100, category: "licence", description: "Domain 2026-11-01 to 2027-10-31" })).toEqual([]);
+    expect(validateEntry({ type: "expense", amountPence: 100, category: "licence", description: "Invoice INV-2026-000123" })).toEqual([]);
+    expect(looksPhone("0131 496 0000")).toBe(true);
+    expect(looksPhone("2026-11-01")).toBe(false);
+  });
+
+  it("writes no prospect names or free-text next actions into the pipeline summary", async () => {
+    mkdirSync(join(dir, "pipeline"), { recursive: true });
+    writeFileSync(join(dir, "pipeline", "prospects.json"), JSON.stringify({ prospects: [
+      { id: "P-001", name: "Hill Bistro", stage: "qualified", nextAction: "Call Jane Smith on 07700 900123", nextActionDue: "2026-10-30" },
+      { id: "P-002", name: "Dale Cafe", stage: "contacted", lastTouch: "2026-09-01" },
+    ] }));
+    const { impl } = fakeFetch(siteRoutes());
+    await runCycle({ dir, now: () => new Date("2026-11-01T09:37:00Z"), env: {}, fetchImpl: impl, log: () => {}, only: "pipeline.review" });
+    const text = readFileSync(join(dir, "pipeline", "summary.json"), "utf8");
+    expect(text).not.toMatch(/Hill Bistro|Dale Cafe|Jane|07700/);
+    expect(JSON.parse(text).due[0].id).toBe("P-001");
   });
 });

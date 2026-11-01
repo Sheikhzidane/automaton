@@ -15,8 +15,10 @@ const GENESIS = '0'.repeat(64);
 
 // Payment, charge, payout, transfer or bank references. An invoice
 // number is not evidence that money arrived. A bank reference has no
-// spaces, so a payer's name cannot be written in as one.
-export const PAYMENT_EVIDENCE = /^((pi|ch|py|po|tr|txn)_[A-Za-z0-9]{3,}|bank:[A-Za-z0-9._\/-]{4,40})$/;
+// spaces and must carry at least four digits (a date, an amount or the
+// bank's own reference), so a payer's name alone cannot pass as one.
+export const PAYMENT_EVIDENCE = /^((pi|ch|py|po|tr|txn)_[A-Za-z0-9]{3,}|bank:(?=(?:[^0-9]*[0-9]){4})[A-Za-z0-9._\/-]{4,40})$/;
+const EVIDENCE_MAX = 80;
 
 // A ledger line can never be erased, so it must hold nothing about a
 // person. Counterparties are pseudonyms; the mapping from pseudonym to
@@ -94,9 +96,16 @@ export function validateEntry(input, entries = []) {
     if (looksPersonal(input[field])) errors.push(`${field} looks like it holds an email address or phone number; use a pseudonym`);
   }
   // A payment reference is often a long run of digits (txn_1234567890,
-  // bank:20261031-60000), which the phone test would refuse. Its format
-  // is checked above and allows no spaces, so only an email is tested.
-  if (looksEmail(input.evidence)) errors.push('evidence looks like it holds an email address; use the payment reference');
+  // bank:20261031-60000) that a phone test could mistake for a number, so
+  // a well-formed reference is checked for an email only. Any other
+  // evidence, on any type of line, gets the full personal-data test.
+  if (input.evidence !== undefined && input.evidence !== null) {
+    const ev = String(input.evidence);
+    if (ev.length > EVIDENCE_MAX) errors.push(`evidence must be ${EVIDENCE_MAX} characters or fewer`);
+    if (PAYMENT_EVIDENCE.test(ev) ? looksEmail(ev) : looksPersonal(ev)) {
+      errors.push('evidence looks like it holds an email address or phone number; use the payment or receipt reference');
+    }
+  }
   return errors;
 }
 

@@ -55,7 +55,9 @@ budget, alerts, `state/engine.json`, the run logs, `status.json`, the
 files. `config.json`, `state/control.json` (the kill switch),
 `state/approvals.json`, `state/memory.json`, the ledger, the pipeline and the
 backlog belong to people; a cycle reads them and never rewrites them. The
-workflow's save step copies only engine-owned paths back.
+workflow's save step copies only engine-owned paths back. The summaries hold
+ids, stages, counts and dates only, never a prospect's name or the free-text
+next action; the daily report quotes the next action from `state/memory.json`.
 
 ## Guarantees
 
@@ -68,9 +70,12 @@ workflow's save step copies only engine-owned paths back.
   still counted. On a laptop a stale lock is replaced and its time charged; in
   GitHub Actions (fresh checkout, one run at a time) a lock that came with the
   checkout is replaced without a charge, and `state/lock.json` is git-ignored.
-- **Alert issues are idempotent.** Each issue carries a hidden marker for its
-  alert; a run whose state was not saved finds the open issue and reuses it
-  instead of opening another.
+- **Alert issues are reconciled every run.** Each issue carries a hidden
+  marker for its alert. Every run lists the open issues the workflow's bot
+  opened (never pull requests, all pages), keeps the oldest per alert, opens
+  one where none exists, and closes duplicates and any issue whose problem
+  has cleared, including one opened by a run whose state was never saved.
+  If the list cannot be read, nothing is opened or closed that run.
 - **Objections are honoured.** A prospect marked `do_not_contact` (or `won`)
   in `pipeline/prospects.json` is never profiled again: matched by FSA id
   (`fhrsIds`) and by normalised business name. Keep the record, with its
@@ -82,18 +87,23 @@ workflow's save step copies only engine-owned paths back.
   an alert. Blocked tasks (missing credential) are not failures.
 - **Budget.** Money: the scheduled runner never runs a costed task. The
   approval rules (single use, within remaining capital; an unreadable ledger
-  means no capital) still apply to a hand-run task. Compute: what GitHub
-  bills, each job rounded up to the minute (cycle job plus setup, plus one
-  minute for the save job), against a monthly cap (default 900 minutes); past
-  it only priority-1 tasks run. The cap limits work, not runs: the schedule
-  itself costs at least 2 billed minutes a run, 8 runs a day, so about 500
-  minutes a month before any work (GitHub Free includes 2,000 private-repo
-  minutes a month).
+  means no capital) still apply to a hand-run task. Compute: only runs in
+  GitHub Actions are charged, as GitHub bills them: the cycle job, timed from
+  the workflow's first step and rounded up to the minute, plus one minute for
+  the save job. A short run is 2 minutes, so the schedule alone is about 500
+  minutes a month at 8 runs a day. The monthly cap (default 1,200 minutes,
+  alert at 80%) sits above that and below GitHub Free's 2,000 private-repo
+  minutes; past it only priority-1 tasks run. The cap limits work, not runs:
+  to stop the minutes, disable the workflow. A run that stops because a
+  people-edited file is unreadable still records its minimum.
 - **Ledger.** Hash-chained, with the last verified head kept in
   `state/engine.json`, so an edited, removed or truncated line is detected.
   Settled revenue needs a payment reference (`pi_`, `ch_`, `py_`, `po_`,
   `tr_`, `txn_` or `bank:` with no spaces), never an invoice number, and the
-  same reference cannot be counted twice. A line can never be erased, so it
+  same reference cannot be counted twice. A `bank:` reference carries at
+  least four digits; any evidence that is not a payment reference is checked
+  for email addresses and phone numbers on every type of line. A line can
+  never be erased, so it
   holds nothing about a person: counterparties are pseudonyms (`CUST-001`),
   categories are short codes, descriptions are at most 120 characters and
   must not name anyone. Keep the pseudonym-to-customer list outside the

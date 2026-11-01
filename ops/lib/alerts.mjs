@@ -29,13 +29,48 @@ export function resolve(alerts, key, now) {
   return true;
 }
 
-// The marker that ties an issue to its alert, so a run whose state was
-// not saved adopts the issue it opened instead of opening another.
+// The marker that ties an issue to its alert. Issues are reconciled with
+// the alerts on every run, so a run whose state was not saved neither
+// opens a duplicate nor leaves an issue open after the problem clears.
 export function issueMarker(key) {
   return `<!-- growth-ops-alert:${String(key).replace(/[^A-Za-z0-9:._-]/g, '')} -->`;
 }
 
-export async function syncIssues(alerts, { http, token, repo, label = 'growth-ops-alert', log }) {
+const MARKER = /<!-- growth-ops-alert:([A-Za-z0-9:._-]+) -->/;
+const MAX_PAGES = 10;
+
+// Open issues (never pull requests) that carry an alert marker, and, in
+// GitHub Actions, that the workflow's own bot opened. Null if the list
+// could not be read in full, so nothing is opened or closed on a guess.
+async function listAlertIssues({ http, repo, headers, author, log }) {
+  const found = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    let res;
+    try {
+      res = await http(`https://api.github.com/repos/${repo}/issues?state=open&per_page=100&page=${page}`, { headers });
+    } catch (err) {
+      log?.('warn', 'could not list open issues', { error: err.message });
+      return null;
+    }
+    if (res.status !== 200) {
+      log?.('warn', 'could not list open issues', { status: res.status });
+      return null;
+    }
+    const items = JSON.parse(res.text);
+    if (!Array.isArray(items)) return null;
+    for (const i of items) {
+      if (!i || i.pull_request) continue;
+      if (author && i.user?.login !== author) continue;
+      const m = typeof i.body === 'string' ? MARKER.exec(i.body) : null;
+      if (m) found.push({ number: i.number, key: m[1] });
+    }
+    if (items.length < 100) return found;
+  }
+  log?.('warn', 'more than 1,000 open issues; alert issues not reconciled this run');
+  return null;
+}
+
+export async function syncIssues(alerts, { http, token, repo, label = 'growth-ops-alert', author = null, now = new Date(), log }) {
   if (!token || !repo) return { synced: 0, skipped: 'no GitHub token in this environment' };
   const headers = {
     authorization: `Bearer ${token}`,
@@ -43,27 +78,37 @@ export async function syncIssues(alerts, { http, token, repo, label = 'growth-op
     'content-type': 'application/json',
     'x-github-api-version': '2022-11-28',
   };
-  let synced = 0;
-  const unsynced = Object.values(alerts.open).filter((a) => !a.issueNumber);
-  let existing = null;
-  if (unsynced.length) {
-    try {
-      // Not filtered by label: GitHub drops labels silently for a token
-      // without push access, so the marker is what identifies an issue.
-      const res = await http(`https://api.github.com/repos/${repo}/issues?state=open&per_page=100`, { headers });
-      if (res.status === 200) existing = JSON.parse(res.text);
-      else log?.('warn', 'could not list open alert issues', { status: res.status });
-    } catch (err) {
-      log?.('warn', 'could not list open alert issues', { error: err.message });
-    }
+  const open = await listAlertIssues({ http, repo, headers, author, log });
+  if (!open) return { synced: 0, skipped: 'open issues could not be listed; will try next run' };
+
+  // The oldest open issue per alert is the one in use; any others are duplicates.
+  const byKey = new Map();
+  const duplicates = [];
+  for (const i of [...open].sort((a, b) => a.number - b.number)) {
+    if (byKey.has(i.key)) duplicates.push(i);
+    else byKey.set(i.key, i);
   }
-  for (const a of unsynced) {
-    // Without the list we cannot tell whether the issue already exists;
-    // wait for the next run rather than risk a duplicate.
-    if (!existing) break;
-    const found = existing.find((i) => typeof i?.body === 'string' && i.body.includes(issueMarker(a.key)));
-    if (found) {
-      a.issueNumber = found.number;
+
+  let synced = 0;
+  const close = async (number, comment) => {
+    try {
+      await http(`https://api.github.com/repos/${repo}/issues/${number}/comments`, { method: 'POST', headers, body: JSON.stringify({ body: comment }) });
+      const res = await http(`https://api.github.com/repos/${repo}/issues/${number}`, { method: 'PATCH', headers, body: JSON.stringify({ state: 'closed' }) });
+      if (res.status === 200) {
+        synced += 1;
+        return true;
+      }
+    } catch (err) {
+      log?.('warn', 'alert issue not closed', { error: err.message });
+    }
+    return false;
+  };
+
+  // Every open alert has exactly one open issue.
+  for (const a of Object.values(alerts.open)) {
+    const existing = byKey.get(a.key);
+    if (existing) {
+      a.issueNumber = existing.number;
       continue;
     }
     try {
@@ -79,31 +124,23 @@ export async function syncIssues(alerts, { http, token, repo, label = 'growth-op
       if (res.status === 201) {
         a.issueNumber = JSON.parse(res.text).number;
         synced += 1;
-      } else log?.('warn', 'alert issue not created', { status: res.status });
+      } else {
+        a.issueNumber = null;
+        log?.('warn', 'alert issue not created', { status: res.status });
+      }
     } catch (err) {
+      a.issueNumber = null;
       log?.('warn', 'alert issue not created', { error: err.message });
     }
   }
-  for (const c of alerts.closed) {
-    if (!c.pendingClose || !c.issueNumber) continue;
-    try {
-      await http(`https://api.github.com/repos/${repo}/issues/${c.issueNumber}/comments`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ body: `Cleared at ${c.resolvedAt}.` }),
-      });
-      const res = await http(`https://api.github.com/repos/${repo}/issues/${c.issueNumber}`, {
-        method: 'PATCH',
-        headers,
-        body: JSON.stringify({ state: 'closed' }),
-      });
-      if (res.status === 200) {
-        c.pendingClose = false;
-        synced += 1;
-      }
-    } catch (err) {
-      log?.('warn', 'alert issue not closed', { error: err.message });
-    }
+
+  // Issues whose problem has cleared, including ones opened by a run whose
+  // state was never saved, and duplicates.
+  const at = now.toISOString();
+  for (const [key, issue] of byKey) {
+    if (!alerts.open[key]) await close(issue.number, `Cleared at ${at}.`);
   }
+  for (const d of duplicates) await close(d.number, `Duplicate of #${byKey.get(d.key).number}; closed at ${at}.`);
+  for (const c of alerts.closed) c.pendingClose = false;
   return { synced };
 }

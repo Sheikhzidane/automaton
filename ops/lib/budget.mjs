@@ -9,18 +9,22 @@ import { monthKey } from './util.mjs';
 export function computeAllowance(budget, now) {
   const month = monthKey(now);
   if (!budget.compute || budget.compute.month !== month) {
-    budget.compute = { month, secondsUsed: 0, capMinutes: budget.compute?.capMinutes ?? 900 };
+    budget.compute = { month, secondsUsed: 0, capMinutes: budget.compute?.capMinutes ?? 1200 };
   }
   return budget.compute;
 }
 
-// What GitHub will bill for one run in which the cycle itself took
-// `cycleSeconds`: the cycle job rounded up to the minute, plus the other
-// jobs at their one-minute minimum.
-export function billedSeconds(cycleSeconds, compute = {}) {
-  const setup = compute.cycleJobSetupSeconds ?? 60;
+// What GitHub will bill for one run: the cycle job rounded up to a whole
+// minute, plus the other jobs at their one-minute minimum. The cycle job's
+// length is measured from GROWTH_OPS_JOB_STARTED_AT (set by the workflow's
+// first step) when known, plus the steps that follow the engine; otherwise
+// it is the cycle's own time plus an allowance for checkout and Node.
+export function billedSeconds(cycleSeconds, compute = {}, jobSecondsSoFar = null) {
   const others = compute.otherBilledMinutesPerRun ?? 1;
-  return (Math.ceil((Math.max(0, cycleSeconds) + setup) / 60) + others) * 60;
+  const jobSeconds = jobSecondsSoFar !== null && Number.isFinite(jobSecondsSoFar)
+    ? Math.max(0, jobSecondsSoFar) + (compute.cycleJobTailSeconds ?? 25)
+    : Math.max(0, cycleSeconds) + (compute.cycleJobSetupSeconds ?? 30);
+  return (Math.max(1, Math.ceil(jobSeconds / 60)) + others) * 60;
 }
 
 export function recordCompute(budget, now, seconds) {

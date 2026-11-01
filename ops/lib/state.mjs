@@ -18,8 +18,11 @@ export const DEFAULT_CONFIG = {
   mission: { name: '£20 to £2,000', capitalPence: 2000, targetNetPence: 200000 },
   schedule: { cron: '37 */3 * * *', note: 'UTC; must match the workflow' },
   // GitHub bills each job rounded up to a whole minute. A run is two
-  // jobs: the cycle (checkout, Node, the cycle itself) and the save.
-  compute: { monthlyMinutesCap: 900, cycleJobSetupSeconds: 60, otherBilledMinutesPerRun: 1 },
+  // jobs: the cycle (checkout, Node, the cycle itself) and the save, so a
+  // short run is 2 billed minutes: about 500 a month at 8 runs a day. The
+  // cap leaves room for that and for weekly FSA runs, under the 2,000 free
+  // private-repository minutes. Only runs in GitHub Actions are charged.
+  compute: { monthlyMinutesCap: 1200, cycleJobSetupSeconds: 30, cycleJobTailSeconds: 25, otherBilledMinutesPerRun: 1 },
   http: { allowHosts: ['opslog.co.uk', 'ratings.food.gov.uk', 'api.github.com'], timeoutMs: 25000 },
   opslog: {
     baseUrl: 'https://opslog.co.uk',

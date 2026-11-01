@@ -1,4 +1,7 @@
 // Reviews the prospect pipeline. Reads only; never contacts anyone.
+// The summary it writes leaves the private state in the cycle's artifact
+// and is committed daily, so it holds ids, stages and dates only: never a
+// name or the free-text next action, which can hold contact details.
 
 import { readJson, writeJsonAtomic, p } from '../lib/util.mjs';
 
@@ -13,14 +16,14 @@ export async function run(ctx) {
   const stale = [];
   const problems = [];
   for (const pr of file.prospects) {
-    if (!STAGES.includes(pr.stage)) problems.push(`${pr.id}: unknown stage "${pr.stage}"`);
+    if (!STAGES.includes(pr.stage)) problems.push(`${pr.id}: unknown stage`);
     else byStage[pr.stage] += 1;
     if (pr.nextActionDue && pr.nextActionDue <= today && !['won', 'lost', 'do_not_contact'].includes(pr.stage)) {
-      due.push({ id: pr.id, name: pr.name, stage: pr.stage, nextAction: pr.nextAction, due: pr.nextActionDue });
+      due.push({ id: pr.id, stage: pr.stage, due: pr.nextActionDue });
     }
     const touched = pr.lastTouch ?? pr.addedAt;
     if (touched && ['contacted', 'replied', 'demo_booked', 'trial'].includes(pr.stage) && ctx.now.valueOf() - new Date(touched).valueOf() > staleMs) {
-      stale.push({ id: pr.id, name: pr.name, stage: pr.stage, lastTouch: touched });
+      stale.push({ id: pr.id, stage: pr.stage, lastTouch: touched });
     }
   }
   const awaitingApproval = file.prospects.filter((x) => x.stage === 'qualified').length;

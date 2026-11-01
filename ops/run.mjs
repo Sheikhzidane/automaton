@@ -88,7 +88,7 @@ async function verifyControls() {
   const capped = { compute: { month: '2026-11', secondsUsed: 60 * 901, capMinutes: 900 } };
   check('Past the compute cap, low-priority tasks stop', denyReason({ task: { priority: 3, costPence: 0 }, budget: capped, control: {}, now }) !== null);
   check('Past the compute cap, priority-1 health checks still run', denyReason({ task: { priority: 1, costPence: 0 }, budget: capped, control: {}, now }) === null);
-  check('Compute is charged as GitHub bills it: each job rounded up to a whole minute', billedSeconds(0) === 120 && billedSeconds(1) === 180 && billedSeconds(60) === 180 && billedSeconds(61) === 240);
+  check('Compute is charged as GitHub bills it: each job rounded up to a whole minute', billedSeconds(0) === 120 && billedSeconds(30) === 120 && billedSeconds(31) === 180 && billedSeconds(0, {}, 40) === 180);
 
   // 4. Ledger rules and integrity
   const ledger = paths(dir).ledger;
@@ -173,6 +173,9 @@ async function verifyControls() {
   ];
   const kept = buildCandidates(sites, { now, exclude: { names: ['Hill Bistro'], ids: [4] } });
   check('A business that objected is never profiled again (by name and by FSA id)', kept.length === 0, kept.map((k) => k.name).join(', '));
+  check('A phone number is refused in any kind of evidence; a date is accepted in a description',
+    validateEntry({ type: 'refund', amountPence: 100, evidence: 'refund to +44 7700 900123' }).length > 0 &&
+    validateEntry({ type: 'expense', amountPence: 100, category: 'licence', description: 'Domain 2026-11-01 to 2027-10-31' }).length === 0);
   check('A payment reference made of digits is accepted; a bank reference with a name is refused',
     validateEntry({ type: 'revenue', amountPence: 100, settled: true, evidence: 'txn_1234567890', counterparty: 'CUST-006' }).length === 0 &&
     validateEntry({ type: 'revenue', amountPence: 100, settled: true, evidence: 'bank:FP JANE SMITH', counterparty: 'CUST-007' }).length > 0);
@@ -185,6 +188,15 @@ async function verifyControls() {
   };
   await syncIssues(alertState, { http: fakeGitHub, token: 't', repo: 'o/r' });
   check('An alert whose issue is already open reuses it instead of opening another', posts === 0 && alertState.open.k1.issueNumber === 41);
+  let patched = 0;
+  const orphanGitHub = async (url, opts = {}) => {
+    const method = opts.method ?? 'GET';
+    if (method === 'GET') return { status: 200, text: JSON.stringify([{ number: 41, body: issueMarker('gone'), user: { login: 'github-actions[bot]' } }]) };
+    if (method === 'PATCH') patched++;
+    return { status: 200, text: '{}' };
+  };
+  await syncIssues({ open: {}, closed: [] }, { http: orphanGitHub, token: 't', repo: 'o/r', author: 'github-actions[bot]' });
+  check('An alert issue left open by a run that was never saved is closed once the problem has cleared', patched === 1);
 
   let failed = 0;
   for (const res of results) {
