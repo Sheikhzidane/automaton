@@ -13,7 +13,7 @@ export async function run(ctx) {
   const perAuthority = [];
   for (const a of m.authorities) {
     const url = `https://ratings.food.gov.uk/api/open-data-files/FHRS${a.id}en-GB.xml`;
-    const res = await ctx.http(url, { maxBytes: 40_000_000, accept: 'application/xml', timeoutMs: 240_000 });
+    const res = await ctx.http(url, { maxBytes: 40_000_000, accept: 'application/xml', timeoutMs: 60_000 });
     if (!res.ok) return { outcome: 'failed', note: `${a.name}: HTTP ${res.status}` };
     const parsed = parseFhrsXml(res.text);
     if (parsed.establishments.length === 0) return { outcome: 'failed', note: `${a.name}: no establishments parsed` };

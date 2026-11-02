@@ -13,7 +13,10 @@ import { makeHttp, redactor } from './http.mjs';
 import { JOBS } from '../jobs/index.mjs';
 
 function jobTimeoutMs(task, config) {
-  if (task.job === 'fsa-refresh') return 10 * 60 * 1000;
+  // Inside the workflow's 8-minute cycle job: four downloads of at most a
+  // minute each, then parsing. Keep jobs shorter than the job timeout, or a
+  // slow week is killed before it saves and retried every run.
+  if (task.job === 'fsa-refresh') return 5 * 60 * 1000;
   if (task.job === 'public-health') return (config.opslog.pages.length * config.http.timeoutMs) + 30000;
   return 120000;
 }
